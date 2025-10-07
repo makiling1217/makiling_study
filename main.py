@@ -1,104 +1,122 @@
+# main.py
 from fastapi import FastAPI, Request
-import os, json, httpx, re
+import os, httpx, json, re, math
 
 app = FastAPI()
 
-LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
-CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-REF_IMAGE_URL = os.getenv("REF_IMAGE_URL")  # 任意：参考画像の https 直リンク
+# ---------------- 共通ユーティリティ ----------------
+def fmt_num(x: float) -> str:
+    s = f"{x:.10g}".rstrip("0").rstrip(".")
+    return s if s else "0"
 
+def reply_text(reply_token: str, text: str):
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    if not token:
+        print("ERROR: LINE_CHANNEL_ACCESS_TOKEN 未設定")
+        return
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {"replyToken": reply_token, "messages": [{"type": "text", "text": text}]}
+    r = httpx.post("https://api.line.me/v2/bot/message/reply",
+                   headers=headers, content=json.dumps(body))
+    print("LINE reply status:", r.status_code, r.text)
+
+# ---------------- 操作手順（番号付きチートシート） ----------------
+CHEATSHEET = (
+    "【fx-CG50：二次方程式 aX²+bX+c=0 の操作手順】\n"
+    "1. [MENU] → アイコン **EQUATION** を選ぶ\n"
+    "2. [F2] Quadratic（aX²+bX+c=0）を選ぶ\n"
+    "3. a を入力 → [EXE]\n"
+    "4. b を入力 → [EXE]\n"
+    "5. c を入力 → [EXE]\n"
+    "6. 解が出たら [▲][▼] で切替、[EXE] で確定\n"
+    "7. 小ワザ：負号は白い「(−)」キー／引き算は灰色「−」。戻るのは [EXIT]\n"
+    "（例：テキストなら「二次 a=1 b=-3 c=2」や「二次 1,-3,2」でもOK）"
+)
+
+def send_cheatsheet(reply_token: str):
+    reply_text(reply_token, CHEATSHEET)
+
+# ---------------- 係数の抽出と計算 ----------------
+NUM = r"[+-]?\s*(?:\d+(?:\.\d+)?|\.\d+)"
+re_abc = re.compile(r"二次.*?a\s*=\s*("+NUM+").*?b\s*=\s*("+NUM+").*?c\s*=\s*("+NUM+")", re.IGNORECASE)
+re_csv = re.compile(r"二次\s+("+NUM+")\s*[,，]\s*("+NUM+")\s*[,，]\s*("+NUM+")")
+
+def parse_coeffs(text: str):
+    t = text.replace("　", " ")
+    m = re_abc.search(t)
+    if m:
+        return tuple(float(x.replace(" ", "")) for x in m.groups())
+    m = re_csv.search(t)
+    if m:
+        return tuple(float(x.replace(" ", "")) for x in m.groups())
+    return None
+
+def solve_quadratic(a: float, b: float, c: float) -> str:
+    # 1次の特例
+    if abs(a) < 1e-12:
+        if abs(b) < 1e-12:
+            return (
+                "【一次（特例）】a=0 かつ b=0\n"
+                f"a={fmt_num(a)}, b={fmt_num(b)}, c={fmt_num(c)}\n"
+                "→ c=0 なら無数の解／c≠0 なら解なし\n\n"
+                "＜操作手順（一次）＞\n"
+                "1.[MENU]→EQUATION\n2.[F1] Linear\n3.b 入力→[EXE]\n4.c 入力→[EXE]"
+            )
+        x = -c/b
+        return (
+            "【一次（特例）】bx+c=0 を解きます\n"
+            f"b={fmt_num(b)}, c={fmt_num(c)}\n"
+            f"→ 解：x = -c/b = {fmt_num(x)}\n\n"
+            "＜操作手順（一次）＞\n"
+            "1.[MENU]→EQUATION\n2.[F1] Linear\n3.b 入力→[EXE]\n4.c 入力→[EXE]"
+        )
+
+    D = b*b - 4*a*c
+    lines = []
+    lines.append("【二次方程式 aX²+bX+c=0 の計算】")
+    lines.append(f"a={fmt_num(a)}, b={fmt_num(b)}, c={fmt_num(c)}")
+    lines.append(f"1) 判別式 D=b²-4ac = {fmt_num(D)}")
+
+    if D > 0:
+        sqrtD = math.sqrt(D)
+        x1 = (-b + sqrtD) / (2*a)
+        x2 = (-b - sqrtD) / (2*a)
+        lines.append("2) D>0 → 異なる実数解")
+        lines.append(f"   x₁ = {fmt_num(x1)}")
+        lines.append(f"   x₂ = {fmt_num(x2)}")
+    elif abs(D) <= 1e-12:
+        x = (-b) / (2*a)
+        lines.append("2) D=0 → 重解")
+        lines.append(f"   x = {fmt_num(x)}")
+    else:
+        sqrtD = math.sqrt(-D)
+        real = (-b) / (2*a)
+        imag = sqrtD / (2*a)
+        lines.append("2) D<0 → 実数解なし（複素数解）")
+        lines.append(f"   x = {fmt_num(real)} ± {fmt_num(imag)} i")
+
+    lines.append("")
+    lines.append("＜電卓の操作（番号付き）＞")
+    lines.append("1.[MENU]→EQUATION")
+    lines.append("2.[F2] Quadratic（aX²+bX+c=0）")
+    lines.append("3.a 入力→[EXE]")
+    lines.append("4.b 入力→[EXE]")
+    lines.append("5.c 入力→[EXE]")
+    lines.append("6.[▲][▼] で解を確認、[EXE] で確定")
+    lines.append("7. 負号は白い「(−)」、引き算は灰色「−」。[EXIT] で戻る")
+    return "\n".join(lines)
+
+# ---------------- ルート ----------------
 @app.get("/")
 def root():
-    return {"ok": True}
+    return {"status": "ok"}
 
-# ===== 共通ヘルパ =====
-async def reply_messages(reply_token: str, messages: list):
-    if not CHANNEL_TOKEN:
-        print("WARN: no LINE_CHANNEL_ACCESS_TOKEN; skip reply")
-        return
-    headers = {"Authorization": f"Bearer {CHANNEL_TOKEN}", "Content-Type": "application/json"}
-    payload = {"replyToken": reply_token, "messages": messages[:5]}  # LINEは最大5件
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(LINE_REPLY_URL, headers=headers, json=payload)
-        print("LINE reply status:", r.status_code, r.text)
-
-def numbered(lines: list) -> str:
-    return "\n".join(f"{i}. {ln}" for i, ln in enumerate(lines, 1))
-
-# ===== fx-CG50：二次方程式の手順 =====
-def guide_fx_cg50_quadratic(a=None, b=None, c=None) -> str:
-    def has(v): return v is not None and str(v).strip() != ""
-    steps = [
-        "Main Menu で「EQUATION」のアイコンを開く（※EQUAと略さない表示）",
-        "画面下のソフトキーで「Poly（多項式）」→ Degree を『2』にする",
-        f"a を入力{f'（{a}）' if has(a) else ''} → [EXE]",
-        f"b を入力{f'（{b}）' if has(b) else ''} → [EXE]",
-        f"c を入力{f'（{c}）' if has(c) else ''} → [EXE]",
-        "解 x₁, x₂ が表示される（[F6] などで表示切替／分数↔小数の切替が出ることがあります）",
-    ]
-    tips = [
-        "負の数は **青い [(-)] → 数字 → [EXE]**（白い [−] は“引き算”なのでNG）",
-        "分数は **[a b/c]** または **÷** を使って 3÷4 のように入力可",
-        "小数は **[.]**、平方根は **[√]**、累乗は **[^]**（または x^2 等）",
-        "カーソル移動は十字キー、[DEL] で1字消去、[AC/ON] で行全消去、[EXIT] で1画面戻る",
-    ]
-    msg = "【fx-CG50：aX² + bX + c = 0 の解き方】\n" + numbered(steps) + "\n\n（入力のコツ）\n" + numbered(tips)
-    if has(a) and has(b) and has(c):
-        msg += f"\n\n入力チェック：a={a}, b={b}, c={c}"
-    return msg
-
-# ===== fx-CG50：よく使う操作（「操作方法」コマンド用）=====
-def help_fx_cg50_cheatsheet() -> str:
-    blocks = []
-
-    blocks.append("【fx-CG50：よく使う操作キー（番号つき）】")
-    blocks.append(numbered([
-        "モード起動：Main Menu → **EQUATION** アイコン",
-        "二次方程式：画面下のソフトキー → **Poly** → **Degree=2** を選ぶ",
-        "確定：**[EXE]**、1つ戻る：**[EXIT]**、全消去：**[AC/ON]**、1文字削除：**[DEL]**",
-        "カーソル移動：十字キー（◀▲▼▶）／画面下の **[F1]〜[F6]** はソフトキー",
-        "負の数：**青い [(-)] → 数字 → [EXE]**（白い [−] は“引き算”）",
-        "分数：**[a b/c]** または **÷** を使って 3÷4 などと入力",
-        "小数：**[.]** を使って 0.25 などと入力",
-        "平方根：**[√]**、二乗：**[x²]**、一般の累乗：**[^]** → 指数 → [EXE]",
-        "括弧：**[(] [)]** でグループ化（例：(2+3)×4）",
-        "結果画面：x₁/x₂ の切替や **分数↔小数（S⇔D）** が表示される場合は画面下の **Fキー** で操作",
-    ]))
-
-    blocks.append("\n【クイック例】\n" + numbered([
-        "EQUATION → Poly → Degree=2",
-        "a=-3 を入力：**[(-)] 3 [EXE]**",
-        "b=1.5 を入力：**1 [.] 5 [EXE]**",
-        "c=3/4 を入力：**3 ÷ 4 [EXE]**（または **3 [a b/c] 4 [EXE]**）",
-    ]))
-
-    blocks.append("\n※画像を送ってもこの一覧は返ります。必要なら『二次 a=1 b=-3 c=2』のように係数付きで送ると、その値で手順を出します。")
-
-    return "\n".join(blocks)
-
-# ===== テキスト解析 =====
-ABC_RE = re.compile(r"a\s*=\s*([\-−]?\s*[\d\.]+).*?b\s*=\s*([\-−]?\s*[\d\.]+).*?c\s*=\s*([\-−]?\s*[\d\.]+)", re.I | re.S)
-def normalize_minus(s: str) -> str:
-    return s.replace("−","-").replace("ー","-").replace("―","-")
-def parse_abc(text: str):
-    t = normalize_minus(text)
-    m = ABC_RE.search(t)
-    if m: return (m.group(1), m.group(2), m.group(3))
-    return (None, None, None)
-
-def looks_quadratic(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in ["二次", "ax^2", "a x^2", "poly", "equa", "equation"])
-
-def is_help_command(text: str) -> bool:
-    t = text.strip().lower()
-    return any(k in t for k in ["操作方法", "使い方", "ヘルプ", "help"])
-
-# ===== Webhook =====
 @app.post("/webhook")
-async def webhook(req: Request):
+async def webhook(request: Request):
+    # Verify対策：壊れた/空JSONでも200
     try:
-        body = await req.json()
+        raw = await request.body()
+        body = json.loads(raw) if raw else {}
     except Exception:
         body = {}
     print("WEBHOOK:", body)
@@ -108,47 +126,40 @@ async def webhook(req: Request):
         return {"ok": True}
 
     ev = events[0]
+    reply_token = ev.get("replyToken", "")
     if ev.get("type") != "message":
         return {"ok": True}
 
-    m = ev.get("message", {})
-    reply_token = ev["replyToken"]
+    msg = ev.get("message", {})
+    mtype = msg.get("type")
 
-    # ---- テキスト ----
-    if m.get("type") == "text":
-        text = m.get("text", "")
-
-        # ①「操作方法」コマンド → チートシート返信（+任意画像）
-        if is_help_command(text):
-            msgs = [{"type":"text","text": help_fx_cg50_cheatsheet()}]
-            if REF_IMAGE_URL:
-                msgs.append({"type":"image","originalContentUrl": REF_IMAGE_URL,"previewImageUrl": REF_IMAGE_URL})
-            await reply_messages(reply_token, msgs)
-            return {"ok": True}
-
-        # ② 二次方程式ガイド
-        if looks_quadratic(text):
-            a,b,c = parse_abc(text)
-            msg = guide_fx_cg50_quadratic(a,b,c)
-            msgs = [{"type":"text","text": msg}]
-            if REF_IMAGE_URL:
-                msgs.append({"type":"image","originalContentUrl": REF_IMAGE_URL,"previewImageUrl": REF_IMAGE_URL})
-            await reply_messages(reply_token, msgs)
-            return {"ok": True}
-
-        # ③ その他のテキスト
-        await reply_messages(reply_token, [{
-            "type":"text",
-            "text":"番号つきで案内します。\n- 画像だけ送ってもOK\n- 『操作方法』でキーの一覧\n- 『二次 a=1 b=-3 c=2』で係数入り手順"
-        }])
+    # 1) 画像→そのまま手順を返信
+    if mtype == "image":
+        send_cheatsheet(reply_token)
         return {"ok": True}
 
-    # ---- 画像：常にチートシート（+任意画像）を返す ----
-    if m.get("type") == "image":
-        msgs = [{"type":"text","text": help_fx_cg50_cheatsheet()}]
-        if REF_IMAGE_URL:
-            msgs.append({"type":"image","originalContentUrl": REF_IMAGE_URL,"previewImageUrl": REF_IMAGE_URL})
-        await reply_messages(reply_token, msgs)
+    # 2) テキスト→「操作方法」 or 係数 or ヘルプ
+    if mtype == "text":
+        text = (msg.get("text") or "").strip()
+
+        if text in ("操作方法", "ヘルプ", "使い方"):
+            send_cheatsheet(reply_token)
+            return {"ok": True}
+
+        coeffs = parse_coeffs(text)
+        if coeffs:
+            a, b, c = coeffs
+            reply_text(reply_token, solve_quadratic(a, b, c))
+            return {"ok": True}
+
+        # 既定の使い方ガイド
+        reply_text(
+            reply_token,
+            "使い方：\n"
+            "・写真を送る → 番号つきの操作手順を返信\n"
+            "・係数で計算 → 例）二次 a=1 b=-3 c=2  または 例）二次 1,-3,2\n"
+            "・操作方法を見る → 「操作方法」"
+        )
         return {"ok": True}
 
     return {"ok": True}
