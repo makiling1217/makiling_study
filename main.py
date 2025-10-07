@@ -1,18 +1,18 @@
-# main.py — fx-CG50 × LINE Bot（画像安定版: 非同期+push 送信）
+# main.py — fx-CG50 × LINE Bot（画像→Vision 安定版 v2）
 from fastapi import FastAPI, Request
-import os, re, io, json, cmath, asyncio
+import os, re, io, json, cmath, asyncio, time, base64
 from typing import List, Dict, Any
 import httpx
 from httpx import Timeout
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-import base64
 
 app = FastAPI()
 
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")  # 変更可: gpt-4o 等
 
-# ---------------- LINE ----------------
+# ---------------- LINE送信 ----------------
 async def line_reply(reply_token: str, texts: List[str]):
     if not LINE_TOKEN or not reply_token: return
     url = "https://api.line.me/v2/bot/message/reply"
@@ -21,7 +21,7 @@ async def line_reply(reply_token: str, texts: List[str]):
                "messages": [{"type":"text","text": t[:4900]} for t in texts[:5]]}
     async with httpx.AsyncClient(timeout=Timeout(10, read=45)) as cli:
         r = await cli.post(url, headers=headers, json=payload)
-        print("LINE reply status:", r.status_code, r.text[:200])
+        print("LINE reply status:", r.status_code, r.text[:160])
 
 async def line_push(user_id: str, texts: List[str]):
     if not LINE_TOKEN or not user_id: return
@@ -32,7 +32,7 @@ async def line_push(user_id: str, texts: List[str]):
             payload = {"to": user_id,
                        "messages": [{"type":"text","text": t[:4900]} for t in texts[i:i+5]]}
             r = await cli.post(url, headers=headers, json=payload)
-            print("LINE push status:", r.status_code, r.text[:200])
+            print("LINE push status:", r.status_code, r.text[:160])
 
 HELP_TEXT = (
     "使い方：\n"
@@ -40,9 +40,10 @@ HELP_TEXT = (
     "2) 係数指定：例) 二次 1 -3 2 / 二次 1,-3,2 / 二次 1.-3.2 / 二次 a=1 b=-3 c=2\n"
     "3) キー操作の一覧：『操作方法』\n"
 )
+
 GENERAL_OPS = (
     "【fx-CG50 キー操作の総合ガイド】\n"
-    "1. 負の数：［(−)］（x10^x左）/ 引き算[−]とは別\n"
+    "1. 負の数：［(−)］（×10^x 左）/ 引き算[−]とは別\n"
     "2. 分数↔小数：[SHIFT]→[S⇔D]\n"
     "3. 角度：[SHIFT]→[SETUP]→Angle\n"
     "4. 複素数：[SHIFT]→[SETUP]→Complex: a+bi\n"
@@ -53,7 +54,7 @@ GENERAL_OPS = (
 def steps_quadratic(a: float, b: float, c: float) -> str:
     return (
         "【fx-CG50 二次方程式（EQUATION）】\n"
-        "1. [MENU] →『EQUA (Equation)』→ [EXE]\n"
+        "1. [MENU] → 『EQUA (Equation)』 → [EXE]\n"
         "2. [F2] POLY → 次数『2』\n"
         f"3. a={a}→[EXE] → b={b}→[EXE] → c={c}→[EXE]（負の数は［(−)］）\n"
         "4. [▼/▲]で x₁, x₂ を確認（[SHIFT]→[S⇔D]で表記切替）\n"
@@ -97,7 +98,7 @@ def parse_quadratic_command(text: str):
     m = re.search(r"a\s*=\s*("+NUM+").*?b\s*=\s*("+NUM+").*?c\s*=\s*("+NUM+")", tail, re.I)
     if m: return tuple(float(x) for x in m.groups())
 
-    m = re.match(r"^\s*([+-]?\d+)\.\s*([+-]?\d+)\.\s*([+-]?\d+)\s*$", tail) # 1.-3.2
+    m = re.match(r"^\s*([+-]?\d+)\.\s*([+-]?\d+)\.\s*([+-]?\d+)\s*$", tail)  # 1.-3.2
     if m: return tuple(float(x) for x in m.groups())
 
     norm = tail
@@ -123,48 +124,78 @@ def parse_equation_line(line: str):
         return {"type":"linear","a":a,"b":b}
     return None
 
-# -------- image I/O --------
+# -------- 画像取得と前処理 --------
 async def fetch_line_image_content(message_id: str) -> bytes:
-    # 正しいエンドポイント（api-data.line.me）で2回までリトライ
-    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"  # ←重要
     headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
     async with httpx.AsyncClient(timeout=Timeout(10, read=45)) as cli:
-        for i in range(2):
+        for i in range(3):
             r = await cli.get(url, headers=headers)
+            print("get image:", r.status_code)
             if r.status_code == 200:
                 return r.content
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.8)
         raise RuntimeError(f"content get failed: {r.status_code}")
 
 def preprocess(img_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(img_bytes)).convert("L")
-    # 200%拡大（上限 2048px）
+    # 200%拡大（上限2048px）
     w,h = img.size
     scale = 2.0
     nw, nh = int(w*scale), int(h*scale)
     if max(nw, nh) > 2048:
         k = 2048 / max(nw, nh); nw, nh = int(nw*k), int(nh*k)
     img = img.resize((nw, nh), Image.LANCZOS)
-    # 強調
+    # コントラスト強調＋シャープ
     img = ImageOps.autocontrast(img, cutoff=2)
     img = ImageEnhance.Contrast(img).enhance(1.8)
     img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=3))
     buf = io.BytesIO(); img.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
 
+# -------- Vision 呼び出し（ResponsesAPI → ChatCompletions フェイルバック） --------
 async def vision_to_equations(img_bytes: bytes) -> List[str]:
-    if not OPENAI_API_KEY: return []
+    if not OPENAI_API_KEY:
+        print("NO OPENAI_API_KEY"); return []
     b64 = base64.b64encode(img_bytes).decode("ascii")
+
+    # 1) Responses API
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
                "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-4o-mini",
+    payload_resp = {
+        "model": VISION_MODEL,
+        "input": [
+            {"role":"user","content":[
+                {"type":"input_text","text":(
+                    "画像から一次/二次方程式を最大2つ、各1行で抽出。"
+                    "例: 'x^2-3x+2=0' や '2x+5=0'。説明禁止、必ず '=0' を付ける。"
+                )},
+                {"type":"input_image","image_url": f"data:image/jpeg;base64,{b64}"}
+            ]}
+        ],
+        "temperature": 0.0,
+        "max_output_tokens": 200
+    }
+    try:
+        async with httpx.AsyncClient(timeout=Timeout(15, read=45)) as cli:
+            r = await cli.post("https://api.openai.com/v1/responses",
+                               headers=headers, json=payload_resp)
+            print("OpenAI(responses) status:", r.status_code)
+            if r.status_code == 200:
+                out = r.json()["output"][0]["content"][0]["text"]
+                lines = [ln.strip() for ln in out.splitlines() if "=0" in ln]
+                if lines: return lines[:2]
+    except Exception as e:
+        print("responses api error:", repr(e))
+
+    # 2) Chat Completions fallback
+    payload_cc = {
+        "model": VISION_MODEL,
         "messages": [
             {"role":"system","content":"Output only equations, one per line."},
             {"role":"user","content":[
-                {"type":"text","text": (
-                    "画像から一次/二次方程式を最大2つ、各1行だけ抽出。"
-                    "例: 'x^2-3x+2=0' や '2x+5=0'。説明や余計な文字は出さない。必ず '=0' を付ける。"
+                {"type":"text","text":(
+                    "画像から一次/二次方程式を最大2つ、各1行のみ。必ず '=0' を付ける。"
                 )},
                 {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{b64}"}}
             ]}
@@ -172,23 +203,38 @@ async def vision_to_equations(img_bytes: bytes) -> List[str]:
         "temperature": 0.0,
         "max_tokens": 200
     }
-    async with httpx.AsyncClient(timeout=Timeout(10, read=60)) as cli:
-        r = await cli.post("https://api.openai.com/v1/chat/completions",
-                           headers=headers, json=payload)
-        if r.status_code != 200:
-            print("OpenAI status:", r.status_code, r.text[:300]); return []
-        content = r.json()["choices"][0]["message"]["content"]
-        lines = [ln.strip() for ln in content.splitlines() if "=0" in ln]
-        return lines[:2]
-
-# -------- background worker --------
-async def handle_image(message_id: str, user_id: str):
     try:
+        async with httpx.AsyncClient(timeout=Timeout(15, read=45)) as cli:
+            r = await cli.post("https://api.openai.com/v1/chat/completions",
+                               headers=headers, json=payload_cc)
+            print("OpenAI(chat) status:", r.status_code)
+            if r.status_code == 200:
+                content = r.json()["choices"][0]["message"]["content"]
+                lines = [ln.strip() for ln in content.splitlines() if "=0" in ln]
+                return lines[:2]
+    except Exception as e:
+        print("chat api error:", repr(e))
+    return []
+
+# -------- 画像フロー（バックグラウンド） --------
+async def handle_image(message_id: str, user_id: str):
+    t0 = time.time()
+    try:
+        print("image flow: start")
         raw = await fetch_line_image_content(message_id)
         proc = preprocess(raw)
-        eq_lines = await vision_to_equations(proc)
+
+        # 45秒ガード：長引いたら中断してメッセージ
+        async def _run():
+            return await vision_to_equations(proc)
+        try:
+            eq_lines = await asyncio.wait_for(_run(), timeout=45.0)
+        except asyncio.TimeoutError:
+            await line_push(user_id, ["解析がタイムアウトしました。A4を画面いっぱい・正面で撮り直して再送してください。"])
+            return
+
         if not eq_lines:
-            await line_push(user_id, ["式を特定できませんでした。紙面を大きく正面から撮って再送してください。"])
+            await line_push(user_id, ["式を特定できませんでした。コントラストを強めて再送してください。"])
             return
 
         probs = []
@@ -216,12 +262,16 @@ async def handle_image(message_id: str, user_id: str):
                     steps_linear(p["a"], p["b"])
                 ]
         await line_push(user_id, out)
+        print("image flow: done in", round(time.time()-t0,2), "sec")
 
     except Exception as e:
         print("image flow error:", repr(e))
         await line_push(user_id, ["画像解析で内部エラーが発生しました。撮り直すか、係数を『二次 1.-3.2』形式で送ってください。"])
 
 # ---------------- FastAPI ----------------
+@app.get("/healthz")
+def health(): return {"ok": True}
+
 @app.get("/")
 def root(): return {"ok": True}
 
@@ -241,9 +291,7 @@ async def webhook(request: Request):
         user_id = ev.get("source", {}).get("userId")
 
         if mtype == "image":
-            # 即時に「解析中…」を reply（1回だけ使用）
             await line_reply(reply_token, ["解析中…（最大2問）"])
-            # 本処理は非同期タスクで実行 → 結果は push
             asyncio.create_task(handle_image(msg.get("id",""), user_id))
             continue
 
