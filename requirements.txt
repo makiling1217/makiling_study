@@ -1,3 +1,5 @@
 fastapi
 uvicorn[standard]
 httpx
+pillow
+openai>=1.44.0
