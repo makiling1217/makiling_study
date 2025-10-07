@@ -1,12 +1,29 @@
 # main.py
 from fastapi import FastAPI, Request
-import os, httpx, json, re, math, base64
+import os, httpx, json, re, math, base64, unicodedata
 
 app = FastAPI()
 
-# ========= 共通ユーティリティ =========
-def fmt_num(x: float) -> str:
-    s = f"{x:.12g}".rstrip("0").rstrip(".")
+# ================= ユーティリティ =================
+def nk(s: str) -> str:
+    """全角→半角などNFKC正規化 & よく出る記号をASCIIへ寄せる"""
+    if not isinstance(s, str): return s
+    s = unicodedata.normalize("NFKC", s)
+    table = {
+        "，": ",", "、": ",", "．": ".", "：": ":", "；": ";",
+        "＝": "=", "–": "-", "—": "-", "―": "-", "−": "-", "〜": "~"
+    }
+    for k, v in table.items():
+        s = s.replace(k, v)
+    return s
+
+def fmt_num(x) -> str:
+    if isinstance(x, complex):
+        r = fmt_num(x.real)
+        i = fmt_num(x.imag)
+        sign = "+" if x.imag >= 0 else "-"
+        return f"{r}{sign}{i}i"
+    s = f"{float(x):.12g}".rstrip("0").rstrip(".")
     return s if s else "0"
 
 def reply_text(reply_token: str, text: str):
@@ -20,16 +37,16 @@ def reply_text(reply_token: str, text: str):
                    headers=headers, content=json.dumps(body))
     print("LINE reply status:", r.status_code, r.text)
 
-# ========= 定型メッセージ =========
+# ================= 定型テキスト =================
 KEY_GUIDE = (
     "【fx-CG50：キー操作の基本（番号付き）】\n"
-    "1. [EXE] 決定／確定\n"
-    "2. [EXIT] 1つ戻る／メニューへ戻る\n"
-    "3. [▲][▼][◀][▶] カーソル移動／解の切替\n"
-    "4. 白い「(−)」=負号、灰色「−」=引き算\n"
-    "5. [DEL] 1文字削除、[AC/ON] 全消去/電源\n"
-    "6. [MENU]→ **EQUATION**（方程式）\n"
-    "7. サブメニュー： [F1] Simultaneous（連立）/ [F2] Quadratic（二次）/ [F3] Polynomial（多項式）\n"
+    "1.[EXE] 決定／確定\n"
+    "2.[EXIT] 1つ戻る／メニューに戻る\n"
+    "3.[▲][▼][◀][▶] カーソル移動／解の切替\n"
+    "4.白い「(−)」=負号、灰色「−」=引き算\n"
+    "5.[DEL] 1文字削除、[AC/ON] 全消去/電源\n"
+    "6.[MENU]→ **EQUATION**（方程式）\n"
+    "7.サブメニュー：[F1] Simultaneous / [F2] Quadratic / [F3] Polynomial\n"
 )
 
 QUAD_STEPS = (
@@ -44,7 +61,7 @@ QUAD_STEPS = (
 )
 
 SIM2_STEPS = (
-    "【fx-CG50：連立（2元） ax+by=c / dx+ey=f（番号付き）】\n"
+    "【fx-CG50：連立（2元） ax+by=c / dx+ey=f】\n"
     "1.[MENU]→EQUATION\n"
     "2.[F1] Simultaneous\n"
     "3.[F1] 2 Unknowns を選ぶ\n"
@@ -54,7 +71,7 @@ SIM2_STEPS = (
 )
 
 SIM3_STEPS = (
-    "【fx-CG50：連立（3元） ax+by+cz=d など（番号付き）】\n"
+    "【fx-CG50：連立（3元） ax+by+cz=d など】\n"
     "1.[MENU]→EQUATION\n"
     "2.[F1] Simultaneous\n"
     "3.[F2] 3 Unknowns を選ぶ\n"
@@ -63,7 +80,7 @@ SIM3_STEPS = (
 )
 
 POLY_STEPS = (
-    "【fx-CG50：多項式（1変数） Aₙxⁿ+…+A₀=0（番号付き）】\n"
+    "【fx-CG50：多項式（1変数） Aₙxⁿ+…+A₀=0】\n"
     "1.[MENU]→EQUATION\n"
     "2.[F3] Polynomial を選ぶ\n"
     "3.次数（n）を選ぶ\n"
@@ -71,28 +88,26 @@ POLY_STEPS = (
     "5.根が表示→[▲][▼] で切替→[EXE]"
 )
 
-def send_key_guide(reply_token): reply_text(reply_token, KEY_GUIDE)
-def send_quad_steps(reply_token): reply_text(reply_token, QUAD_STEPS)
-
-# ========= 係数テキストの既存パース（二次） =========
+# ================= テキスト入力（二次）パース =================
 NUM = r"[+-]?\s*(?:\d+(?:\.\d+)?|\.\d+)"
 re_abc = re.compile(r"二次.*?a\s*=\s*("+NUM+").*?b\s*=\s*("+NUM+").*?c\s*=\s*("+NUM+")", re.I)
-re_csv = re.compile(r"二次\s+("+NUM+")\s*[,，]\s*("+NUM+")\s*[,，]\s*("+NUM+")", re.I)
+re_csv = re.compile(r"二次\s+("+NUM+")\s*[,]\s*("+NUM+")\s*[,]\s*("+NUM+")", re.I)
 
 def parse_coeffs_quadratic(text: str):
-    t = text.replace("　"," ")
+    t = nk(text)
     m = re_abc.search(t) or re_csv.search(t)
     if not m: return None
-    return tuple(float(x.replace(" ", "")) for x in m.groups())
+    vals = []
+    for x in m.groups():
+        vals.append(float(nk(x).replace(" ", "")))
+    return tuple(vals)  # (a,b,c)
 
-# ========= 数値計算 =========
+# ================= 数値計算 =================
 def solve_quadratic(a,b,c):
     if abs(a) < 1e-12:
         if abs(b) < 1e-12:
-            info = "a=0,b=0 → c=0なら無数の解／c≠0なら解なし"
-            return info, []
-        x = -c/b
-        return "一次（特例）", [("x", x)]
+            return "退化（a=b=0）", []
+        return "一次(特例)", [("x", -c/b)]
     D = b*b - 4*a*c
     if D > 0:
         s = math.sqrt(D); x1 = (-b + s)/(2*a); x2 = (-b - s)/(2*a)
@@ -101,39 +116,33 @@ def solve_quadratic(a,b,c):
         x = (-b)/(2*a)
         return "重解", [("x", x)]
     s = math.sqrt(-D); real = (-b)/(2*a); imag = s/(2*a)
-    return "複素数解", [("x", complex(real, imag)), ("x", complex(real, -imag))]
+    return "複素数解", [("x1", complex(real, imag)), ("x2", complex(real, -imag))]
 
 def solve_sim2(a,b,c,d,e,f):
     det = a*e - b*d
     if abs(det) < 1e-12:
-        return "行列式=0 → 解が一意に定まりません", []
+        return "行列式=0 → 一意解なし", []
     x = (c*e - b*f)/det
     y = (a*f - c*d)/det
     return "一意解", [("x", x), ("y", y)]
 
 def solve_sim3(M, v):
-    # M: 3x3、v: 3
-    det = (
-        M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1])
-        - M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0])
-        + M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0])
-    )
-    if abs(det) < 1e-12:
-        return "行列式=0 → 解が一意に定まりません", []
-    # クラメル
     def det3(A):
         return (
             A[0][0]*(A[1][1]*A[2][2]-A[1][2]*A[2][1])
             - A[0][1]*(A[1][0]*A[2][2]-A[1][2]*A[2][0])
             + A[0][2]*(A[1][0]*A[2][1]-A[1][1]*A[2][0])
         )
+    det = det3(M)
+    if abs(det) < 1e-12:
+        return "行列式=0 → 一意解なし", []
     Mx = [[v[0],M[0][1],M[0][2]],[v[1],M[1][1],M[1][2]],[v[2],M[2][1],M[2][2]]]
     My = [[M[0][0],v[0],M[0][2]],[M[1][0],v[1],M[1][2]],[M[2][0],v[2],M[2][2]]]
     Mz = [[M[0][0],M[0][1],v[0]],[M[1][0],M[1][1],v[1]],[M[2][0],M[2][1],v[2]]]
     x = det3(Mx)/det; y = det3(My)/det; z = det3(Mz)/det
     return "一意解", [("x", x), ("y", y), ("z", z)]
 
-# ========= 電卓の番号付きステップ生成 =========
+# ================= ステップ生成 =================
 def steps_quadratic(a,b,c):
     return QUAD_STEPS + f"\n\n【今回の係数】a={fmt_num(a)}, b={fmt_num(b)}, c={fmt_num(c)}"
 
@@ -153,21 +162,24 @@ def steps_sim3(M, v):
     return SIM3_STEPS + "\n\n【今回の係数】\n" + s
 
 def steps_poly(deg, coeffs_desc):
-    # coeffs_desc: [(power, value)] 例: [(3,A3), (2,A2), (1,A1), (0,A0)]
     lined = ", ".join([f"A{p}={fmt_num(v)}" for p, v in coeffs_desc])
     return POLY_STEPS + f"\n\n【今回の係数】{lined}"
 
-# ========= OpenAI Vision で画像から式を抽出 =========
+# ================= 画像→式抽出（OpenAI Vision） =================
+def extract_json_block(text: str):
+    text = text.strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if m: return m.group(0)
+    return text  # そもそもJSONだけならそのまま
+
 def analyze_math_image(image_bytes: bytes):
     """
-    画像から問題タイプと係数を抽出。
-    返り値の例:
-    {"type":"quadratic", "equation":"x^2-3x+2=0", "a":1,"b":-3,"c":2}
-    {"type":"linear", "equation":"2x+3=0", "b":2,"c":3}  # bx+c=0形式
-    {"type":"sim2", "equation":"{ax+by=c; dx+ey=f}", "a":..., "b":..., "c":..., "d":..., "e":..., "f":...}
-    {"type":"sim3", "M":[[a,b,c],[d,e,f],[g,h,i]], "v":[j,k,l], "equation":"..."}
-    {"type":"poly", "degree":3, "coeffs": {"3":1,"2":-3,"1":0,"0":2}, "equation":"x^3-3x+2=0"}
-    失敗時は None
+    画像から複数の問題を抽出して返す:
+    { "problems": [
+        {"type":"quadratic","equation":"x^2-3x+2=0","a":1,"b":-3,"c":2},
+        {"type":"sim2","equation":"{2x+y=5; x-y=1}","a":2,"b":1,"c":5,"d":1,"e":-1,"f":1}
+    ]}
+    失敗時 None
     """
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
@@ -175,22 +187,19 @@ def analyze_math_image(image_bytes: bytes):
     b64 = base64.b64encode(image_bytes).decode("ascii")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     system_prompt = (
-        "You extract math problems from a single photo. "
-        "Return STRICT JSON only. Decide one of types: "
-        "quadratic (a x^2 + b x + c = 0), "
-        "linear (b x + c = 0), "
-        "sim2 (two linear equations ax+by=c; dx+ey=f), "
-        "sim3 (three linear equations), "
-        "poly (univariate polynomial = 0 up to degree 6). "
-        "Fields by type:\n"
-        "- quadratic: {type,equation,a,b,c}\n"
-        "- linear: {type,equation,b,c}\n"
-        "- sim2: {type,equation,a,b,c,d,e,f}\n"
-        "- sim3: {type,equation,M,v}  # M 3x3, v len 3\n"
-        "- poly: {type,equation,degree,coeffs}  # coeffs is map power->value\n"
-        "Numbers must be decimals (no fractions). If unreadable, answer {\"type\":\"unknown\"}."
+        "You read math problems from ONE photo. "
+        "Return STRICT JSON ONLY with this schema:\n"
+        "{ \"problems\": [ PROBLEM, ... ] }\n"
+        "PROBLEM is one of:\n"
+        "- quadratic: {type:\"quadratic\", equation, a, b, c}  # a x^2 + b x + c = 0\n"
+        "- linear:    {type:\"linear\",    equation, b, c}     # b x + c = 0\n"
+        "- sim2:      {type:\"sim2\",      equation, a,b,c,d,e,f}\n"
+        "- sim3:      {type:\"sim3\",      equation, M, v}     # M 3x3, v len 3\n"
+        "- poly:      {type:\"poly\",      equation, degree, coeffs}  # coeffs is map power->value\n"
+        "If multiple problems exist, include up to 2 most prominent. "
+        "If unreadable, return {\"problems\":[]}. Numbers must be decimals."
     )
-    user_text = "Extract structured coefficients for the main equation(s). JSON only."
+    user_text = "Extract problems as structured JSON. JSON only (no prose)."
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
@@ -208,23 +217,23 @@ def analyze_math_image(image_bytes: bytes):
         print("OpenAI status:", r.status_code)
         data = r.json()
         content = data["choices"][0]["message"]["content"]
-        # JSONだけにしているが保険で抽出
-        content = content.strip()
-        # JSONでなければ落とす
-        info = json.loads(content)
+        j = extract_json_block(content)
+        info = json.loads(j)
         if not isinstance(info, dict): return None
+        if "problems" not in info: return None
         return info
     except Exception as e:
         print("OpenAI Vision error:", e)
         return None
 
-# ========= Webhook =========
+# ================= FastAPI ルート =================
 @app.get("/")
-def root(): return {"status":"ok"}
+def root():
+    return {"status": "ok"}
 
 @app.post("/webhook")
 async def webhook(req: Request):
-    # Verify 対策
+    # Verify対策：空や非JSONでも200
     try:
         raw = await req.body()
         body = json.loads(raw) if raw else {}
@@ -233,17 +242,20 @@ async def webhook(req: Request):
     print("WEBHOOK:", body)
 
     events = body.get("events", [])
-    if not events: return {"ok": True}
+    if not events:
+        return {"ok": True}
+
     ev = events[0]
-    if ev.get("type") != "message": return {"ok": True}
+    if ev.get("type") != "message":
+        return {"ok": True}
 
-    reply_token = ev.get("replyToken","")
-    msg = ev.get("message", {}); mtype = msg.get("type")
+    reply_token = ev.get("replyToken", "")
+    msg = ev.get("message", {})
+    mtype = msg.get("type")
 
-    # ------- 画像：Vision → 解釈 → 手順＋式＋答え -------
+    # ---------- 画像 ----------
     if mtype == "image":
-        # LINE 画像を取得
-        token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN","")
+        token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
         if not token:
             reply_text(reply_token, "⚠ 環境変数が未設定です（LINE_CHANNEL_ACCESS_TOKEN）")
             return {"ok": True}
@@ -259,124 +271,89 @@ async def webhook(req: Request):
             return {"ok": True}
 
         info = analyze_math_image(img)
-        if not info or info.get("type") in (None,"unknown"):
-            # フォールバック：まずは二次の手順＋使い方
-            reply_text(reply_token,
-                QUAD_STEPS + "\n\n画像から式が読み取れませんでした。\n"
+        if not info or not info.get("problems"):
+            # 読めなかったら丁寧にフォールバック
+            reply_text(
+                reply_token,
+                "画像から式を特定できませんでした。\n"
+                "・影/ブレ/斜めを減らし明るく撮影\n"
+                "・問題が複数ならメイン問題を拡大\n\n"
                 "テキストでもOK：例）二次 a=1 b=-3 c=2 / 例）二次 1,-3,2\n"
-                "一覧は「操作方法」で表示できます。")
-            return {"ok": True}
-
-        t = info.get("type")
-        if t == "quadratic":
-            a=float(info["a"]); b=float(info["b"]); c=float(info["c"])
-            kind, sols = solve_quadratic(a,b,c)
-            sol_txt = "\n".join([f"{name} = {fmt_num(val.real) if isinstance(val,complex) else fmt_num(val)}"
-                                 + (f" ± {fmt_num(val.imag)}i" if isinstance(val,complex) and abs(val.imag)>1e-15 else "")
-                                 for name,val in sols]) or "解なし/条件付き"
-            text = (
-                "【認識結果】二次方程式\n"
-                f"式：{info.get('equation','(不明)')}\n"
-                f"判別：{kind}\n{sol_txt}\n\n"
-                + steps_quadratic(a,b,c)
+                "一覧は「操作方法」で表示できます。"
             )
-            reply_text(reply_token, text)
             return {"ok": True}
 
-        if t == "linear":
-            b=float(info["b"]); c=float(info["c"])
-            if abs(b) < 1e-12:
-                ans = "b=0 → c=0なら無数の解／c≠0なら解なし"
+        # 最大2問に制限して返信をまとめる
+        out_lines = []
+        count = 0
+        for p in info["problems"]:
+            if count >= 2: break
+            t = p.get("type")
+            eq = p.get("equation", "(不明)")
+            count += 1
+            header = f"【問題{count}】種別：{t}\n式：{eq}"
+            if t == "quadratic":
+                a=float(p["a"]); b=float(p["b"]); c=float(p["c"])
+                kind, sols = solve_quadratic(a,b,c)
+                ans = "\n".join([f"{name} = {fmt_num(v)}" for name,v in sols]) or "解なし/条件付き"
+                out_lines.append(header + f"\n判別：{kind}\n{ans}\n\n" + steps_quadratic(a,b,c))
+            elif t == "linear":
+                b=float(p["b"]); c=float(p["c"])
+                if abs(b) < 1e-12:
+                    ans = "b=0 → c=0なら無数の解／c≠0なら解なし"
+                else:
+                    ans = f"x = {fmt_num(-c/b)}"
+                steps = (
+                    "【一次（bx+c=0）の操作】\n"
+                    "1.[MENU]→EQUATION\n"
+                    "2.（機種により Simultaneous 内）Linear を選択\n"
+                    "3.b 入力→[EXE]、c 入力→[EXE]\n"
+                    "4.解を確認→[EXE]（負号は白い「(−)」）"
+                )
+                out_lines.append(header + f"\n解：{ans}\n\n" + steps)
+            elif t == "sim2":
+                a,b_,c,d,e,f = map(float, (p["a"],p["b"],p["c"],p["d"],p["e"],p["f"]))
+                kind, sols = solve_sim2(a,b_,c,d,e,f)
+                ans = "\n".join([f"{name} = {fmt_num(v)}" for name,v in sols]) or "解なし/条件付き"
+                out_lines.append(header + f"\n解の種別：{kind}\n{ans}\n\n" + steps_sim2(a,b_,c,d,e,f))
+            elif t == "sim3":
+                M = [[float(x) for x in row] for row in p["M"]]
+                v = [float(x) for x in p["v"]]
+                kind, sols = solve_sim3(M, v)
+                ans = "\n".join([f"{name} = {fmt_num(vv)}" for name,vv in sols]) or "解なし/条件付き"
+                out_lines.append(header + f"\n解の種別：{kind}\n{ans}\n\n" + steps_sim3(M, v))
+            elif t == "poly":
+                deg = int(p.get("degree", 0))
+                coeffs_map = {int(k): float(v) for k,v in p.get("coeffs", {}).items()}
+                coeffs_desc = sorted(coeffs_map.items(), key=lambda kv: -kv[0])
+                out_lines.append(header + "\n（数値解の列挙は電卓で確認）\n\n" + steps_poly(deg, coeffs_desc))
             else:
-                x = -c/b; ans = f"x = {fmt_num(x)}"
-            text = (
-                "【認識結果】一次方程式（bx+c=0）\n"
-                f"式：{info.get('equation','(不明)')}\n"
-                f"解：{ans}\n\n"
-                "＜電卓の操作（番号付き）＞\n"
-                "1.[MENU]→EQUATION\n"
-                "2.[F1] Linear（機種により Simultaneous 内に含まれる場合あり）\n"
-                "3.b 入力→[EXE]\n"
-                "4.c 入力→[EXE]\n"
-                "5.解を確認→[EXE]\n"
-                "※負号は白い「(−)」"
-            )
-            reply_text(reply_token, text)
-            return {"ok": True}
+                out_lines.append(header + "\nこの種類は未対応です。")
 
-        if t == "sim2":
-            a,b,c,d,e,f = map(float, (info["a"],info["b"],info["c"],info["d"],info["e"],info["f"]))
-            kind, sols = solve_sim2(a,b,c,d,e,f)
-            sol_txt = "\n".join([f"{name} = {fmt_num(val)}" for name,val in sols]) or "解なし/条件付き"
-            text = (
-                "【認識結果】二元連立\n"
-                f"式：{info.get('equation','(不明)')}\n"
-                f"解の種別：{kind}\n{sol_txt}\n\n"
-                + steps_sim2(a,b,c,d,e,f)
-            )
-            reply_text(reply_token, text)
-            return {"ok": True}
-
-        if t == "sim3":
-            M = info["M"]; v = info["v"]
-            M = [[float(x) for x in row] for row in M]
-            v = [float(x) for x in v]
-            kind, sols = solve_sim3(M, v)
-            sol_txt = "\n".join([f"{name} = {fmt_num(val)}" for name,val in sols]) or "解なし/条件付き"
-            text = (
-                "【認識結果】三元連立\n"
-                f"式：{info.get('equation','(不明)')}\n"
-                f"解の種別：{kind}\n{sol_txt}\n\n"
-                + steps_sim3(M, v)
-            )
-            reply_text(reply_token, text)
-            return {"ok": True}
-
-        if t == "poly":
-            deg = int(info.get("degree", 0))
-            coeffs_map = {int(k): float(v) for k,v in info.get("coeffs", {}).items()}
-            # 並べ替え（高次→定数）
-            coeffs_desc = sorted(coeffs_map.items(), key=lambda kv: -kv[0])
-            # 簡易的に実根/複素根の列挙（解析はここでは省略し、電卓入力を重視）
-            eq = info.get("equation","(不明)")
-            text = (
-                "【認識結果】多項式\n"
-                f"式：{eq}\n"
-                "（根の数値計算は電卓でご確認ください）\n\n" +
-                steps_poly(deg, coeffs_desc)
-            )
-            reply_text(reply_token, text)
-            return {"ok": True}
-
-        # その他
-        reply_text(reply_token, "画像を解析しましたがこの種類は未対応です。『操作方法』で一覧を表示できます。")
+        reply_text(reply_token, "\n\n".join(out_lines))
         return {"ok": True}
 
-    # ------- テキスト：コマンド群 -------
+    # ---------- テキスト ----------
     if mtype == "text":
-        text = (msg.get("text") or "").strip()
+        text = nk(msg.get("text") or "")
 
-        # 操作方法 → キー一覧
-        if text in ("操作方法", "キー操作", "ヘルプ", "キー一覧"):
-            send_key_guide(reply_token)
+        # 操作方法（総合ガイド）
+        if text in ("操作方法","キー操作","ヘルプ","キー一覧"):
+            reply_text(reply_token, KEY_GUIDE)
             return {"ok": True}
 
-        # ガイド（種類別の手順だけ欲しい）
-        if text in ("二次", "二次方程式", "手順"):
-            send_quad_steps(reply_token); return {"ok": True}
-
-        # 二次の係数（既存）
+        # 「二次 ...」係数パース
         co = parse_coeffs_quadratic(text)
         if co:
             a,b,c = co
             kind, sols = solve_quadratic(a,b,c)
-            sol_txt = "\n".join([f"{name} = {fmt_num(val.real) if isinstance(val,complex) else fmt_num(val)}"
-                                 + (f" ± {fmt_num(val.imag)}i" if isinstance(val,complex) and abs(val.imag)>1e-15 else "")
-                                 for name,val in sols]) or "解なし/条件付き"
+            eq = f"{fmt_num(a)}x^2 + {fmt_num(b)}x + {fmt_num(c)} = 0"
+            ans = "\n".join([f"{name} = {fmt_num(v)}" for name,v in sols]) or "解なし/条件付き"
             reply_text(
                 reply_token,
-                f"【二次】a={fmt_num(a)}, b={fmt_num(b)}, c={fmt_num(c)}\n"
-                f"判別：{kind}\n{sol_txt}\n\n" + steps_quadratic(a,b,c)
+                "【二次】\n"
+                f"式：{eq}\n"
+                f"判別：{kind}\n{ans}\n\n" + steps_quadratic(a,b,c)
             )
             return {"ok": True}
 
@@ -384,7 +361,7 @@ async def webhook(req: Request):
         reply_text(
             reply_token,
             "使い方：\n"
-            "1) 問題の写真を送る → 種類を判定し、番号付きの電卓手順＋式＆答えを返信\n"
+            "1) 問題の写真を送る → 種類を判定し、番号付きの電卓手順＋式＆答えを返信（最大2問）\n"
             "2) 二次をテキストで計算 → 例）二次 a=1 b=-3 c=2  または 例）二次 1,-3,2\n"
             "3) キー操作の一覧 → 「操作方法」"
         )
