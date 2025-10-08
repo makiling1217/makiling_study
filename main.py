@@ -36,7 +36,7 @@ async def root():
 def line_headers(json_type: bool = True) -> Dict[str, str]:
     h = {"Authorization": f"Bearer {LINE_TOKEN}"}
     if json_type:
-        h["Content-Type"] = "application/json"}
+        h["Content-Type"] = "application/json"headers["Content-Type"] = "application/json"
     return h
 
 async def line_reply(reply_token: str, messages: List[Dict[str, Any]]):
@@ -405,3 +405,4 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
