@@ -5,3 +5,8 @@ pillow
 opencv-python-headless
 sympy
 openai
+fastapi
+uvicorn[standard]
+httpx
+openai>=1.40.0
+pillow
