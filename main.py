@@ -260,85 +260,77 @@ async def handle_text(user_id: str, reply_token: str, text: str):
     await line_reply(reply_token, [{"type":"text","text": howto}])
 
 # ---------- 画像メッセージ ----------
-async def handle_image(user_id: str, reply_token: str, message_id: str):
-    # まず即時返信（無返信防止）
-    await line_reply(reply_token, [{"type":"text","text":"解析中…（数秒お待ちください）"}])
+# --- PATCH 2: 画像ハンドラ（必ず即返信→後で結果を push）---
+async def handle_image(user_id: str, reply_token: str, message: dict):
+    # 1) まず即時に「解析中…」を返信（無反応対策）
+    try:
+        await line_reply(reply_token, [{"type": "text", "text": "解析中…（数秒お待ちください）"}])
+    except Exception as e:
+        print("REPLY ERROR:", e)
 
     try:
-        raw = await get_line_image_bytes(message_id)
-        pre = preprocess_for_ocr(raw)
-        problems = await vision_extract_problems(pre)
+        # 2) 画像を取得（LINE保存/外部URLの両対応）
+        raw = await get_line_image_bytes_from_event(message)
+
+        # 3) 前処理→数式抽出（あなたの既存関数名に合わせて）
+        pre = preprocess_for_ocr(raw)                 # 既にある想定
+        problems = await vision_extract_problems(pre) # 既にある想定（最大2問返すような実装）
 
         if not problems:
             raise RuntimeError("式を特定できませんでした")
 
-        out_msgs = []
-        count = 0
+        out_msgs, count = [], 0
         for p in problems:
             if count >= 2:
                 break
-            cls = p.get("classification","other")
-            expr = p.get("expression","")
+
+            cls = p.get("classification", "other")
+            expr = p.get("expression", "")
+
             if cls == "quadratic" and p.get("quadratic"):
                 a = float(p["quadratic"]["a"])
                 b = float(p["quadratic"]["b"])
                 c = float(p["quadratic"]["c"])
-                D, kind, roots, _ = solve_quadratic(a,b,c)
-                out_msgs.append({"type":"text","text":
-                    f"【抽出(二次)】{expr}\n a={a}, b={b}, c={c}\n判別式D={D} → {kind}\n{format_roots(roots)}"})
-                out_msgs.append({"type":"text","text": steps_quadratic_fx(a,b,c)})
+                D, kind, roots, _ = solve_quadratic(a, b, c)  # 既存の二次解法
+                out_msgs += [
+                    {"type": "text",
+                     "text": f"【抽出(二次)】{expr}\n a={a}, b={b}, c={c}\n判別式 D={D} → {kind}\n{format_roots(roots)}"},
+                    {"type": "text", "text": steps_quadratic_fx(a, b, c)}  # fx-CG50 の番号付き手順（EXE入り）
+                ]
                 count += 1
+
             elif cls == "binomial" and p.get("binomial"):
-                n = int(p["binomial"]["n"]); k = int(p["binomial"]["k"]); p_ = float(p["binomial"]["p"])
-                comb = math.comb(n,k)
-                val = comb*(p_**k)*((1-p_)**(n-k))
-                out_msgs.append({"type":"text","text":
-                    f"【抽出(二項)】{expr}\n P(X={k})=C({n},{k})·p^{k}(1-p)^{n-k}={comb}×{p_}^{k}×{1-p_}^{n-k} = {val:.10g}"})
-                out_msgs.append({"type":"text","text": steps_binom_fx(n,k,p_)})
+                n = int(p["binomial"]["n"])
+                k = int(p["binomial"]["k"])
+                p_ = float(p["binomial"]["p"])
+                val = math.comb(n, k) * (p_ ** k) * ((1 - p_) ** (n - k))
+                out_msgs += [
+                    {"type": "text",
+                     "text": f"【抽出(二項)】{expr}\nP(X={k}) = C({n},{k})·p^{k}(1-p)^{n-k} = {val:.10g}"},
+                    {"type": "text", "text": steps_binom_fx(n, k, p_)}  # 必要なら実装
+                ]
                 count += 1
 
         if not out_msgs:
             raise RuntimeError("対応分類が見つかりませんでした")
 
-        # 解析結果を push（reply は上で済み）
-        # 分割しても 5 通まで
-        await line_push(user_id, out_msgs[:5])
+        # 4) 解析結果を push（1:1 トーク推奨。失敗時は reply にフォールバック）
+        try:
+            await line_push(user_id, out_msgs[:5])
+        except Exception as e:
+            print("PUSH ERROR, fallback to reply:", e)
+            await line_reply(reply_token, [out_msgs[0]])
 
     except Exception as e:
         print("IMAGE FLOW ERROR:", e)
         advice = (
             "式を特定できませんでした。\n"
-            "・写真はA4全体でOK。こちらで自動拡大/強調しています。\n"
-            "・それでも難しい場合は、係数で送ってください：\n"
-            "  例）「二次 1,-3,2」 または 「二次 a=1 b=-3 c=2」\n"
-            "・キー操作の一覧は『操作方法』と送信してください。"
+            "こちらで自動拡大/強調は実施しましたが難しいようです。\n"
+            "・係数で送信 → 例）「二次 1,-3,2」や「二次 a=1 b=-3 c=2」\n"
+            "・キー操作一覧 → 「操作方法」"
         )
-        await line_push(user_id, [{"type":"text","text": advice}])
-
-# ---------- ルーティング ----------
-@app.get("/")
-async def root():
-    return {"status": "ok"}
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    body = await request.json()
-    events = body.get("events", [])
-    for ev in events:
-        t = ev.get("type")
-        src = ev.get("source", {})
-        user_id = src.get("userId")
-        if t == "message":
-            msg = ev.get("message", {})
-            mtype = msg.get("type")
-            reply_token = ev.get("replyToken")
-            if mtype == "text":
-                text = msg.get("text", "")
-                await handle_text(user_id, reply_token, text)
-            elif mtype == "image":
-                message_id = msg.get("id")
-                await handle_image(user_id, reply_token, message_id)
-            else:
-                await line_reply(reply_token, [{"type":"text","text":"テキストか画像で送ってください。"}])
-    return {"ok": True}
-
+        try:
+            await line_reply(reply_token, [{"type": "text", "text": advice}])
+        except:
+            await line_push(user_id, [{"type": "text", "text": advice}])
+# --- PATCH 2 END ---
