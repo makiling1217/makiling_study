@@ -33,6 +33,24 @@ async def line_reply(reply_token: str, messages: List[dict]):
     async with httpx.AsyncClient(timeout=20) as ac:
         r = await ac.post(LINE_REPLY_URL, headers=line_headers(), json=payload)
         r.raise_for_status()
+# --- PATCH 1: 画像バイト列の取得（LINE保存/外部URLの両対応）---
+async def get_line_image_bytes_from_event(message: dict) -> bytes:
+    import httpx
+    # LINEサーバに保存されている画像
+    if message.get("contentProvider", {}).get("type", "line") == "line":
+        url = f"https://api-data.line.me/v2/bot/message/{message['id']}/content"
+        async with httpx.AsyncClient(timeout=30) as ac:
+            r = await ac.get(url, headers=line_headers(json_type=False))
+            r.raise_for_status()
+            return r.content
+    # 外部URLの画像（転送等）
+    else:
+        url = message["contentProvider"]["originalContentUrl"]
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as ac:
+            r = await ac.get(url)
+            r.raise_for_status()
+            return r.content
+# --- PATCH 1 END ---
 
 async def line_push(user_id: str, messages: List[dict]):
     payload = {"to": user_id, "messages": messages[:5]}
@@ -323,3 +341,4 @@ async def webhook(request: Request):
             else:
                 await line_reply(reply_token, [{"type":"text","text":"テキストか画像で送ってください。"}])
     return {"ok": True}
+
