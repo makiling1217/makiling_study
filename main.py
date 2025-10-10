@@ -1,98 +1,175 @@
-import base64, hashlib, hmac, json, os, logging
+import os, json, base64, hmac, hashlib, logging, re
 from typing import Any, Dict, List
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 
+# ====== 基本設定 ======
 app = FastAPI()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+LINE_CONTENT_URL = "https://api.line.me/v2/bot/message/{messageId}/content"
+
 HEADERS_JSON = {
     "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
 
-def verify_signature(body_bytes: bytes, signature: str) -> bool:
+# ====== 署名検証 ======
+def verify_signature(body: bytes, signature: str) -> bool:
     if not LINE_CHANNEL_SECRET:
-        logging.error("ENV LINE_CHANNEL_SECRET is empty")
+        logging.error("LINE_CHANNEL_SECRET is empty")
         return False
-    mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body_bytes, hashlib.sha256).digest()
-    expect = base64.b64encode(mac).decode("utf-8")
-    ok = hmac.compare_digest(expect, signature)
+    mac = hmac.new(LINE_CHANNEL_SECRET.encode(), body, hashlib.sha256).digest()
+    expect = base64.b64encode(mac).decode()
+    ok = hmac.compare_digest(expect, signature or "")
     if not ok:
-        logging.error("Signature NG (expect=%s, got=%s)", expect, signature)
+        logging.error("Signature NG")
     return ok
 
+# ====== LINE 返信 ======
 async def line_reply(reply_token: str, messages: List[Dict[str, Any]]) -> None:
-    async with httpx.AsyncClient(timeout=10) as ac:
+    async with httpx.AsyncClient(timeout=20) as ac:
         r = await ac.post(LINE_REPLY_URL, headers=HEADERS_JSON, json={
-            "replyToken": reply_token,
-            "messages": messages[:5]  # LINE仕様：最大5件
+            "replyToken": reply_token, "messages": messages[:5]
         })
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            logging.exception("LINE reply error %s %s", r.status_code, r.text)
-            raise e
+        r.raise_for_status()
 
+# ====== 画像バイト取得 ======
+async def get_line_image_bytes(message_id: str) -> bytes:
+    url = LINE_CONTENT_URL.format(messageId=message_id)
+    async with httpx.AsyncClient(timeout=30) as ac:
+        r = await ac.get(url, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"})
+        r.raise_for_status()
+        return r.content
+
+# ====== fx-CG50 手順テンプレ（問題に応じて返す） ======
+def cg50_steps_for_text(text: str) -> str:
+    t = text.replace(" ", "")
+    # 1) 放物線 y=-x^2+4ax+b 系
+    if ("y=-x^2+4ax+b" in t) or ("放物線" in t and "4ax+b" in t):
+        return (
+            "【fx-CG50 操作】\n"
+            "1) MENU → GRAPH → EXE（FUNC 画面）\n"
+            "2) Y1 を ON（カーソルを Y1 行→F1[SELECT] で左の＝が濃く）\n"
+            "3) Y1 に次を入力 → EXE\n"
+            "   [(-)] → [X,θ,T] → [x²] → [+] → 4 → [×] → [ALPHA][log](A) → [×] → [X,θ,T] → [+] → [ALPHA][ln](B)\n"
+            "   ※ [ALPHA][log]＝A，[ALPHA][ln]＝B\n"
+            "4) A, B を入れる：MENU → RUN-MAT\n"
+            "   例: A=0.5 は 0 . 5 → [SHIFT][RCL](STO▶) → [ALPHA][log](A) → EXE\n"
+            "       B=4   は 4 → [SHIFT][RCL] → [ALPHA][ln](B) → EXE\n"
+            "5) MENU → GRAPH → F6[DRAW]\n"
+            "6) 頂点は SHIFT+F5[G-Solv] → MAX（下向き放物線）で読み取る\n"
+        )
+    # 2) 勝率 p=1/3 の勝敗確率（Aチーム3勝0敗/5試合3勝2敗 など）
+    if ("勝率" in t or "確率" in t) and ("1/3" in t or "１/３" in t or "1÷3" in t):
+        return (
+            "【fx-CG50 操作（RUN-MATのみ）】\n"
+            "a) 3戦全勝： (1÷3) を括弧で →  ( 1 ÷ 3 ) → [SHIFT][^] → 3 → EXE\n"
+            "b) 5戦3勝2敗： 5C3×(1/3)^3×(2/3)^2 を計算\n"
+            "   5 × 4 ÷ 2 ÷ 1 → EXE で 10 を得ても良い（=5C3）\n"
+            "   10 × ( 1 ÷ 3 ) [SHIFT][^] 3 × ( 2 ÷ 3 ) [SHIFT][^] 2 → EXE\n"
+        )
+    # デフォルト
+    return (
+        "【fx-CG50 基本】\n"
+        "・関数：MENU→GRAPH、方程式：MENU→EQUA、数値計算：MENU→RUN-MAT\n"
+        "・グラフは式を Y1 に入れて EXE → F6[DRAW]、解読は SHIFT+F5[G-Solv]\n"
+        "・係数を文字 A,B にして RUN-MAT で A=… を STO▶ 代入 → 再描画\n"
+    )
+
+# ====== 画像を GPT で読んで解く ======
+async def solve_from_image(img_bytes: bytes) -> str:
+    if not OPENAI_API_KEY:
+        return "（サーバ設定：OPENAI_API_KEY 未設定）"
+
+    b64 = base64.b64encode(img_bytes).decode()
+    # OpenAI Chat Completions（Vision）
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{
+            "role": "system",
+            "content": (
+                "あなたは日本の高校数学・中学数学の解説アシスタントです。"
+                "A4までの試験プリント画像が来ます。最大2問まで。"
+                "各問について必ず次の形式で返してください：\n"
+                "【問題】(OCRした日本語)\n"
+                "【答え】(数値や式。分数は可能なら既約)\n"
+                "【考え方】(3行以内)\n"
+                "【電卓手順】fx-CG50用のキー列を角括弧で具体的に（例：[(-)] [X,θ,T] [x²] ...、[SHIFT][RCL] など。EXEを入れる場所も）\n"
+            )
+        },{
+            "role":"user",
+            "content":[
+                {"type":"text","text":"この画像の数学問題を読み取り、上の形式で日本語で出力してください。"},
+                {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
+            ]
+        }],
+        "temperature": 0.2,
+        "max_tokens": 1200
+    }
+
+    async with httpx.AsyncClient(timeout=60) as ac:
+        r = await ac.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json=payload
+        )
+        r.raise_for_status()
+        data = r.json()
+        text = data["choices"][0]["message"]["content"]
+
+    # 足りない場合に補助の定型手順をつける（よく出る2タイプの判定）
+    extra = cg50_steps_for_text(text)
+    return text + "\n\n" + extra
+
+# ====== ルーティング ======
 @app.get("/")
-def health():
-    return {"ok": True}
+def hello(): return {"ok": True}
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # ① 署名検証
-    signature = request.headers.get("x-line-signature", "")
     body_bytes = await request.body()
-    if not verify_signature(body_bytes, signature):
+    if not verify_signature(body_bytes, request.headers.get("x-line-signature", "")):
         raise HTTPException(status_code=400, detail="Bad signature")
 
     body = json.loads(body_bytes.decode("utf-8"))
     events = body.get("events", [])
     logging.info("events=%s", json.dumps(events, ensure_ascii=False))
 
-    # ② 各イベント処理
     for ev in events:
-        etype = ev.get("type")
-        if etype != "message":
-            # 既読など他イベントはスキップ（必要なら追加）
+        if ev.get("type") != "message":
             continue
 
-        msg = ev.get("message", {})
-        mtype = msg.get("type")
+        m = ev.get("message", {})
+        mtype = m.get("type")
         reply_token = ev.get("replyToken")
 
         try:
-            if mtype == "text":
-                user_text = msg.get("text", "")
-                await line_reply(reply_token, [{
-                    "type": "text",
-                    "text": f"受け取りました：{user_text}"
-                }])
+            if mtype == "image":
+                # 1) 画像取得 → 2) GPT でOCR+解答 → 3) 返信
+                img = await get_line_image_bytes(m.get("id"))
+                answer = await solve_from_image(img)
+                await line_reply(reply_token, [{"type":"text","text": answer[:4900]}])
 
-            elif mtype == "image":
-                # 画像は内容を取得せず “受信したよ” と返す（まずは無反応回避）
-                await line_reply(reply_token, [{
-                    "type": "text",
-                    "text": "画像を受信しました📷（解析は未対応です。テキストで問題文を送ってもOK）"
-                }])
+            elif mtype == "text":
+                txt = m.get("text", "")
+                # 画像なしでも、問題テキストならそのまま補助の手順を付けて返す
+                extra = cg50_steps_for_text(txt)
+                await line_reply(reply_token, [{"type":"text","text": f"受信：{txt}\n\n{extra}"}])
 
             else:
-                await line_reply(reply_token, [{
-                    "type": "text",
-                    "text": f"{mtype} メッセージはまだ未対応です。テキストか画像を送ってください。"
-                }])
+                await line_reply(reply_token, [{"type":"text","text": f"{mtype} には未対応です。"}])
 
-        except Exception:
-            # 例外が出ても“何か返す”ようにしてデバッグ継続
+        except Exception as e:
             logging.exception("handler error")
             try:
-                await line_reply(reply_token, [{"type":"text","text":"内部エラー：ログを確認します🙇"}])
+                await line_reply(reply_token, [{"type":"text","text": f"内部エラー：{e}"}])
             except Exception:
                 pass
 
-    # ③ LINE 仕様：とにかく 200 を返す
     return "OK"
