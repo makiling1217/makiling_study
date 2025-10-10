@@ -143,6 +143,73 @@ async def process_line_events(body_bytes: bytes, signature: str):
                 await line_reply(reply_token, [{"type": "text", "text": f"{mtype} は未対応です。"}])
     except Exception:
         log.exception("process_line_events error")
+# ===== 安全計算ユーティリティ =====
+import ast, math, re
+from typing import Any
+
+ALLOWED_FUNCS = {
+    "sin": lambda x: math.sin(math.radians(x)),
+    "cos": lambda x: math.cos(math.radians(x)),
+    "tan": lambda x: math.tan(math.radians(x)),
+    "asin": lambda x: math.degrees(math.asin(x)),
+    "acos": lambda x: math.degrees(math.acos(x)),
+    "atan": lambda x: math.degrees(math.atan(x)),
+    "sqrt": math.sqrt,
+    "log": math.log,      # 自然対数
+    "log10": math.log10,
+    "abs": abs
+}
+ALLOWED_NAMES = {"pi": math.pi, "e": math.e}
+
+class SafeEval(ast.NodeVisitor):
+    def visit(self, node):
+        if isinstance(node, ast.Expression): return self.visit(node.body)
+        if isinstance(node, ast.Num): return node.n  # py<3.8
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)): return node.value
+        if isinstance(node, ast.BinOp):
+            l, r = self.visit(node.left), self.visit(node.right)
+            if isinstance(node.op, ast.Add): return l + r
+            if isinstance(node.op, ast.Sub): return l - r
+            if isinstance(node.op, ast.Mult): return l * r
+            if isinstance(node.op, ast.Div): return l / r
+            if isinstance(node.op, ast.Pow): return l ** r
+            if isinstance(node.op, ast.Mod): return l % r
+            raise ValueError("operator not allowed")
+        if isinstance(node, ast.UnaryOp):
+            v = self.visit(node.operand)
+            if isinstance(node.op, ast.UAdd): return +v
+            if isinstance(node.op, ast.USub): return -v
+            raise ValueError("unary op not allowed")
+        if isinstance(node, ast.Name):
+            if node.id in ALLOWED_NAMES: return ALLOWED_NAMES[node.id]
+            raise ValueError("name not allowed")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name): raise ValueError("call not allowed")
+            fname = node.func.id
+            if fname not in ALLOWED_FUNCS: raise ValueError(f"func {fname} not allowed")
+            args = [self.visit(a) for a in node.args]
+            return ALLOWED_FUNCS[fname](*args)
+        raise ValueError("node not allowed")
+
+def safe_calc(expr: str) -> float:
+    # 角度記号「°」に対応: 例) 30° → sin(30)等は ALLOWED_FUNCS側で度→ラジアン変換済み
+    # ただし「30°」単体は radに直すとややこしいので、ユーザーには sin(30°) など関数内に入れてもらう前提。
+    tree = ast.parse(expr, mode="eval")
+    return SafeEval().visit(tree)
+
+def cg50_keyseq(expr: str) -> str:
+    """
+    超簡易：fx-CG50 キー案内（代表的なものだけ）
+    - sin(30) → [SHIFT][SETUP]で角度Deg確認 → [SIN] 3 0 [)]
+    - 乗算/除算/累乗 → × / ÷ / ^ キー想定
+    ※ 実機での微調整は適宜。ここではガイド用の擬似列を返す。
+    """
+    seq = expr
+    seq = re.sub(r"\s+", "", seq)
+    seq = seq.replace("sin", "[SIN]").replace("cos", "[COS]").replace("tan", "[TAN]")
+    seq = seq.replace("sqrt", "[√]").replace("log10", "[LOG]10,").replace("log", "[LN]")
+    seq = seq.replace("*", "×").replace("/", "÷").replace("**", "^")
+    return "角度:Deg を確認 → 入力: " + seq + " → [EXE]"
 
 # ====== ルーティング ======
 @app.get("/")
@@ -156,3 +223,4 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     sig  = request.headers.get("x-line-signature", "")
     background_tasks.add_task(process_line_events, body, sig)
     return Response(status_code=200)
+
