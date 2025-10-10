@@ -235,8 +235,76 @@ async def webhook(request: Request):
                 await line_reply(reply_token, [{"type":"text","text": f"内部エラー：{e}"}])
             except Exception:
                 pass
+                
 
     return "OK"
+
+# main.py
+from fastapi import FastAPI, Request, BackgroundTasks, Response
+
+app = FastAPI()
+
+@app.get("/")
+def health():
+    return {"ok": True}
+
+def handle_events(body_bytes: bytes, signature: str):
+    # ここで署名検証・返信など重い処理を実施
+    # ...（既存のロジックを丸ごと移動）...
+    pass
+
+@app.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    body = await request.body()
+    sig  = request.headers.get("x-line-signature", "")
+    # すぐにバックグラウンドで処理
+    background_tasks.add_task(handle_events, body, sig)
+    # LINEには**即**200を返す
+    return Response(status_code=200)
+# main.py
+import os
+import logging
+from fastapi import FastAPI, Request, BackgroundTasks, Response
+
+# 必要なら LINE SDK などの import
+# from linebot import LineBotApi, WebhookHandler
+# from linebot.exceptions import InvalidSignatureError
+
+app = FastAPI()
+logger = logging.getLogger("uvicorn.error")
+
+# 任意：ヘルスチェック
+@app.get("/")
+def health():
+    return {"ok": True}
+
+# ここに “重い処理/外部呼び出し” を全部集約
+def process_line_events(body_bytes: bytes, signature: str):
+    try:
+        body_text = body_bytes.decode("utf-8")
+
+        # === あなたの既存ロジックをここに移す ===
+        # 例:
+        # channel_secret = os.environ["LINE_CHANNEL_SECRET"]
+        # channel_token  = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+        # handler = WebhookHandler(channel_secret)
+        # line_bot_api = LineBotApi(channel_token)
+        # handler.handle(body_text, signature)   # ここでイベント分岐・返信など
+        # =======================================
+
+        logger.info("LINE events processed.")
+    except Exception as e:
+        logger.exception(f"process_line_events error: {e}")
+
+# Webhook: 即 200 を返して起動時間・外部待ちを回避
+@app.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    body = await request.body()
+    signature = request.headers.get("x-line-signature", "")
+    # 実処理はバックグラウンドへ
+    background_tasks.add_task(process_line_events, body, signature)
+    # LINE へは**すぐ** 200 を返す（検証・本番ともタイムアウト回避）
+    return Response(status_code=200)
 
 
 
