@@ -306,5 +306,22 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     # LINE へは**すぐ** 200 を返す（検証・本番ともタイムアウト回避）
     return Response(status_code=200)
 
+from flask import Flask, request
+from concurrent.futures import ThreadPoolExecutor
+
+app = Flask(__name__)
+executor = ThreadPoolExecutor(max_workers=4)
+
+def process_line_events(body_text, signature):
+    # ここに既存の LINE ロジック
+    pass
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    signature = request.headers.get("X-Line-Signature", "")
+    body_text = request.get_data(as_text=True)
+    executor.submit(process_line_events, body_text, signature)
+    return ("", 200)
+
 
 
