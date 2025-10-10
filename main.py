@@ -38,6 +38,20 @@ async def line_reply(reply_token: str, messages: List[Dict[str, Any]]) -> None:
             "replyToken": reply_token, "messages": messages[:5]
         })
         r.raise_for_status()
+        
+# ===== LINE 画像/動画/音声を取得（bytesを返す） =====
+import os, httpx
+
+LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+
+async def download_line_content(message_id: str) -> bytes:
+    """message_id からコンテンツ(画像等)をダウンロード"""
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"  # ← api-data が正解
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()            # 404/401 はここで例外になります
+        return r.content
 
 # ====== 画像バイト取得 ======
 async def get_line_image_bytes(message_id: str) -> bytes:
@@ -94,7 +108,7 @@ async def solve_from_image(img_bytes: bytes) -> str:
         "messages": [{
             "role": "system",
             "content": (
-                "あなたは日本の高校数学・中学数学の解説アシスタントです。"
+                "あなたは日本の大学数学・高校数学・中学数学の解説アシスタントです。"
                 "A4までの試験プリント画像が来ます。最大2問まで。"
                 "各問について必ず次の形式で返してください：\n"
                 "【問題】(OCRした日本語)\n"
@@ -173,3 +187,4 @@ async def webhook(request: Request):
                 pass
 
     return "OK"
+
