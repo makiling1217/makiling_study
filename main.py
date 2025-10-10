@@ -140,6 +140,56 @@ async def solve_from_image(img_bytes: bytes) -> str:
     # 足りない場合に補助の定型手順をつける（よく出る2タイプの判定）
     extra = cg50_steps_for_text(text)
     return text + "\n\n" + extra
+from fastapi import FastAPI, Request
+import httpx
+
+app = FastAPI()
+
+async def line_reply(reply_token: str, messages: list[dict]):
+    url = "https://api.line.me/v2/bot/message/reply"
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    body = {"replyToken": reply_token, "messages": messages}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=headers, json=body)
+        r.raise_for_status()
+
+@app.post("/webhook")
+async def webhook(req: Request):
+    body = await req.json()
+    for ev in body.get("events", []):
+        if ev.get("type") == "message":
+            msg = ev["message"]
+
+            # --- 画像メッセージ ---
+            if msg["type"] == "image":
+                print("message.id =", msg["id"])  # ← ログに出す（後でcurlで使える）
+
+                cp = msg.get("contentProvider", {"type": "line"})
+                if cp["type"] == "line":
+                    data = await download_line_content(msg["id"])
+                else:
+                    # 外部URLの画像（contentProvider: external）の場合
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        r = await client.get(cp["originalContentUrl"])
+                        r.raise_for_status()
+                        data = r.content
+
+                # ここで OCR/数式読取→解答→電卓手順を生成する処理に渡す
+                # 今は到達確認としてサイズを返す
+                await line_reply(
+                    ev["replyToken"],
+                    [{"type": "text",
+                      "text": f"画像OK: {len(data)} bytes 取得。message.id={msg['id']}"}]
+                )
+                continue
+
+            # --- それ以外（テキスト等）は既存処理 ---
+            # await line_reply(...)
+
+    return {"ok": True}
 
 # ====== ルーティング ======
 @app.get("/")
@@ -187,5 +237,6 @@ async def webhook(request: Request):
                 pass
 
     return "OK"
+
 
 
