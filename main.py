@@ -1,335 +1,349 @@
 # main.py
-# LINE 画像→問題抽出→解答→fx-CG50の番号付きキー操作を返す
-# テキスト指示:
-#  - 「操作方法」…総合ガイド（F1〜F6/負号/EXEなど）
-#  - 「二次 1,-3,2」「二次1 -3 2」「二次 a=1 b=-3 c=2」…解＋手順
-# 環境変数: LINE_CHANNEL_ACCESS_TOKEN, OPENAI_API_KEY
-
-import os
-import io
-import re
-import json
-import base64
-from typing import Any, Dict, List, Optional, Tuple
+# FastAPI + LINE Bot + OpenAI Vision
+# 画像(A4想定)→前処理→AIで最大2問抽出→式/解/手順を返信
+# テキスト:
+#   ・「操作方法」：総合ガイド(番号付き)
+#   ・「二次 a=1 b=-3 c=2」 / 「二次 1,-3,2」 / 「二次 1 -3 2」：解＋手順
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-import httpx
-from PIL import Image, ImageEnhance, ImageOps
+import os, httpx, json, base64, math
+from PIL import Image, ImageOps, ImageEnhance
+from io import BytesIO
+from typing import List, Dict
 
-# ---------- 環境 ----------
-LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL_VISION = os.getenv("OPENAI_MODEL_VISION", "gpt-4o-mini")  # vision対応
-OPENAI_MODEL_TEXT = os.getenv("OPENAI_MODEL_TEXT", "gpt-4o-mini")
+# ==== 環境変数 ====
+LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+VISION_MODEL = os.environ.get("VISION_MODEL", "gpt-4o-mini")  # 好きなら gpt-4o に
 
 app = FastAPI()
 
-# ---------- 共通 ----------
-def line_headers(json_type: bool = True) -> Dict[str, str]:
-    h = {"Authorization": f"Bearer {LINE_TOKEN}"}
-    if json_type:
-        h["Content-Type"] = "application/json"
-    return h
-
-async def line_reply(reply_token: str, messages: List[Dict[str, Any]]) -> None:
+# ========= ユーティリティ =========
+async def line_reply(reply_token: str, messages: List[Dict]):
+    if not LINE_TOKEN:
+        print("WARN: no LINE_CHANNEL_ACCESS_TOKEN; skip reply")
+        return
     url = "https://api.line.me/v2/bot/message/reply"
-    body = {"replyToken": reply_token, "messages": messages[:5]}
-    async with httpx.AsyncClient(timeout=30.0) as ac:
-        r = await ac.post(url, headers=line_headers(True), json=body)
-        r.raise_for_status()
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
+    payload = {"replyToken": reply_token, "messages": messages[:5]}
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(url, headers=headers, json=payload)
+        print("LINE reply status:", r.status_code, r.text)
 
-async def line_push(user_id: str, messages: List[Dict[str, Any]]) -> None:
+async def line_push(user_id: str, messages: List[Dict]):
+    if not LINE_TOKEN:
+        print("WARN: no LINE_CHANNEL_ACCESS_TOKEN; skip push")
+        return
     url = "https://api.line.me/v2/bot/message/push"
-    body = {"to": user_id, "messages": messages[:5]}
-    async with httpx.AsyncClient(timeout=30.0) as ac:
-        r = await ac.post(url, headers=line_headers(True), json=body)
-        r.raise_for_status()
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
+    payload = {"to": user_id, "messages": messages[:5]}
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(url, headers=headers, json=payload)
+        print("LINE push status:", r.status_code, r.text)
 
-def ok(msg: str = "ok") -> Dict[str, Any]:
-    return {"status": msg}
+def split_long_text(txt: str, chunk=1800) -> List[str]:
+    out, cur = [], ""
+    for line in txt.splitlines():
+        if len(cur) + len(line) + 1 > chunk:
+            out.append(cur)
+            cur = ""
+        cur += (line + "\n")
+    if cur:
+        out.append(cur)
+    return out[:5]  # LINEは一度に最大5件
 
-# ---------- fx-CG50 定型手順（共通） ----------
-def cg50_quadratic_steps(a: float, b: float, c: float) -> List[str]:
-    # 二次方程式の標準キー手順（EXE必須で細かく）
-    steps = [
-        "1. [MENU] → 画面の『EQUATION』を十字キーで選択 → [EXE]",
-        "2. 『POLY』を選択 → [EXE]",
-        "3. 次数『2』を選択 → [EXE]（二次方程式）",
-        f"4. a= の枠で {a} と入力 → [EXE]",
-        f"5. b= の枠で {b} と入力 → [EXE]",
-        f"6. c= の枠で {c} と入力 → [EXE]",
-        "7. 解（x1, x2）が表示される → 必要に応じて [▲]/[▼] で切替",
-        "8. 終了は [EXIT] を数回"
+# ==== 操作ガイド ====
+GUIDE = """\
+【fx-CG50 操作方法（総合）】
+1) MENU → GRAPH → EXE（FUNC 画面に入る）※右下に DRAW が見えること
+2) Y1 行へカーソル → F1(SELECT) で左端の「＝」を濃く（ON）
+3) Y1 を空にする → DEL
+4) 数式の入力は次のキー順で。EXE を押すタイミングは必ず指示どおりに！
+   例) y = −x² + 4ax + b
+   [(-)] → [X,θ,T] → [x²] → [+] → 4 → [×] → [ALPHA][A] → [×] → [X,θ,T] → [+] → [ALPHA][B] → [EXE]
+   ※ [ALPHA] はピンクの “A/B/C…”。[X,θ,T] は X キー。x² は二乗キー。
+5) 描画：F6(DRAW)。解読支援：SHIFT+F5(G-Solv) から ROOT/INTERSECT/MAX/MIN など
+6) 方程式を解くなら：MENU → EQUA → EXE → [F2](Polynomial) → degree を選ぶ → 係数 a,b,c を入れて EXE
+7) RUN-MAT で A=0.5 のように代入する：
+   [AC/ON] → 0.5 → [SHIFT][RCL](STO▶) → [ALPHA][A] → EXE
+   B=4 なら 4 → [SHIFT][RCL] → [ALPHA][B] → EXE
+   ※ [SHIFT][RCL] は “STO▶” です（x² の右、EXIT の左にあるキーが [RCL]）
+"""
+
+# ==== 数学処理（最小限）====
+def solve_quadratic(a: float, b: float, c: float):
+    D = b*b - 4*a*c
+    if D > 0:
+        r1 = (-b - math.sqrt(D)) / (2*a)
+        r2 = (-b + math.sqrt(D)) / (2*a)
+        kind = "2実数解"
+        roots = sorted([r1, r2])
+    elif D == 0:
+        r = -b / (2*a)
+        kind = "重解"
+        roots = [r, r]
+    else:
+        kind = "虚数解"
+        roots = []
+    return kind, D, roots
+
+def steps_quadratic(a, b, c):
+    # Equation（EQUA）での丁寧な番号手順
+    s = []
+    s.append("1. [MENU] → EQUA → EXE（方程式）")
+    s.append("2. [F2](Polynomial) → degree=2 → EXE")
+    s.append(f"3. 係数を入力 → a={a} → EXE → b={b} → EXE → c={c} → EXE")
+    s.append("4. [F6](Solve) → 解が表示 → [EXE] で確定")
+    s.append("5. 戻って確認したい場合：MENU → GRAPH → Y1 を “ax²+bx+c” の形で入力 → F6(DRAW) → SHIFT+F5(G-Solv)")
+    return s
+
+def format_numbered(items: List[str]) -> str:
+    return "\n".join([f"{i+1}. {t}" for i, t in enumerate(items)])
+
+# ==== テキストコマンド処理 ====
+def try_parse_quadratic(text: str):
+    t = text.replace("，", ",").replace("．", ".").replace("　", " ").strip()
+    if not t.startswith("二次"):
+        return None
+    raw = t.replace("二次", "").strip()
+    # 形式1: a=1 b=-3 c=2
+    if "a=" in raw or "b=" in raw or "c=" in raw:
+        vals = {}
+        for part in raw.replace("＝", "=").split():
+            if "=" in part:
+                k, v = part.split("=", 1)
+                try:
+                    vals[k.strip()] = float(v.replace(",", ""))
+                except:
+                    pass
+        if all(k in vals for k in ("a","b","c")):
+            return vals["a"], vals["b"], vals["c"]
+    # 形式2: 1,-3,2 / 1 -3 2 / 1.-3.2（区切りなんでも）
+    raw2 = raw.replace(",", " ").replace("/", " ").replace("・"," ").replace(".."," ").replace("."," ").replace("　"," ")
+    nums = []
+    for p in raw2.split():
+        try:
+            nums.append(float(p))
+        except:
+            pass
+    if len(nums) >= 3:
+        return nums[0], nums[1], nums[2]
+    return None
+
+def build_operating_steps_for_quadratic(a, b, c):
+    # “EQUA 法”と“GRAPH 法”の2通りを番号付きで返す（EXE込み）
+    equa = steps_quadratic(a,b,c)
+    graph = [
+        "1. [MENU] → GRAPH → EXE（FUNC 画面へ。右下に DRAW が見えること）",
+        "2. Y1 行へカーソル → F1(SELECT) で左の「＝」を濃く（ON）→ DEL で空に",
+        "3. 次をそのまま入力 → [EXE]\n   [ALPHA][A] → [X,θ,T] → [x²] → [+] → [ALPHA][B] → [×] → [X,θ,T] → [+] → [ALPHA][C]",
+        "   例: a=1, b=-3, c=2 なら 1×x² + (−3)×x + 2",
+        "4. F6(DRAW) で描画",
+        "5. SHIFT+F5(G-Solv) → [F1](ROOT) で解を確認（複数ある場合は → / ← で移動）",
     ]
+    return equa, graph
+
+# ==== 画像処理 & OpenAI Vision ====
+def pil_enhance_for_ocr(b: bytes) -> bytes:
+    img = Image.open(BytesIO(b)).convert("L")
+    # 余白トリミング（ざっくり）
+    img = ImageOps.expand(img, border=2, fill=255)
+    img = ImageOps.autocontrast(img)
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    # A4でも読みやすいよう 200% 拡大（上限 2600px）
+    w, h = img.size
+    scale = 2.0 if max(w,h) < 1800 else 1.5
+    img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+    out = BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+async def openai_extract_two_problems(img_bytes: bytes) -> Dict:
+    if not OPENAI_API_KEY:
+        return {"status":"no_api_key"}
+    data_url = "data:image/png;base64," + base64.b64encode(img_bytes).decode()
+    sys = (
+        "You extract at most TWO math problems from the image. "
+        "Return JSON with problems:[{id,title,latex,kind,params,answer,explain}]. "
+        "Keep it short; if numeric coefficients are readable, use them."
+    )
+    user = [
+        {"type":"text","text":"Read up to TWO problems (A4 photo). For each: id like (5) or (8), latex equation or short statement, kind (quadratic/binomial/other), params, numeric answer if solvable, and a brief explanation."},
+        {"type":"image_url","image_url":{"url": data_url}}
+    ]
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={
+                "model": VISION_MODEL,
+                "temperature": 0.1,
+                "messages": [
+                    {"role":"system","content":sys},
+                    {"role":"user","content":user}
+                ],
+                "response_format": {"type":"json_object"}
+            }
+        )
+        if r.status_code != 200:
+            return {"status":"api_error","detail":r.text}
+        try:
+            js = r.json()["choices"][0]["message"]["content"]
+            return {"status":"ok","data":json.loads(js)}
+        except Exception as e:
+            return {"status":"parse_error","detail":str(e), "raw":r.text[:500]}
+
+def build_fx_steps_from_ai(problem: Dict) -> List[str]:
+    kind = (problem.get("kind") or "").lower()
+    steps = []
+    if kind.startswith("quadratic") and problem.get("params"):
+        a = problem["params"].get("a"); b = problem["params"].get("b"); c = problem["params"].get("c")
+        if isinstance(a,(int,float)) and isinstance(b,(int,float)) and isinstance(c,(int,float)):
+            equa, graph = build_operating_steps_for_quadratic(a,b,c)
+            steps = ["【EQUA（方程式）】"] + [*equa] + ["", "【GRAPH（確認用）】"] + [*graph]
+        else:
+            steps = [
+                "【GRAPH（文字係数のまま）】",
+                "1. MENU → GRAPH → EXE",
+                "2. Y1 行を ON → DEL で空",
+                "3. y = −x² + 4ax + b （問題の式）をそのままキーで入力 → EXE",
+                "4. F6(DRAW) → SHIFT+F5(G-Solv) → 頂点/ROOT などで確認",
+                "5. 文字 a,b に具体値があるなら RUN-MAT で A,B を代入（0.5 → SHIFT+RCL → ALPHA A → EXE など）"
+            ]
+    elif kind.startswith("binomial") and problem.get("params"):
+        steps = [
+            "【RUN-MAT（確率）】",
+            "1. MENU → RUN-MAT → EXE",
+            "2. nCr( n , k ) × p^k × (1−p)^(n−k) をそのまま入力 → EXE",
+            "   例：C(5,3)×(1/3)^3×(2/3)^2"
+        ]
+    else:
+        steps = [
+            "【一般】",
+            "1. MENU → GRAPH または RUN-MAT",
+            "2. 問題の式にあわせて入力 → EXE",
+            "3. 必要に応じて G-Solv や Solve を使う"
+        ]
     return steps
 
-def cg50_key_guide() -> str:
-    guide = [
-        "【fx-CG50 キー操作・総合ガイド】",
-        "1. 方向キー: 十字キーで項目を選ぶ → [EXE] で決定",
-        "2. [SHIFT]: 黄印の機能 / [ALPHA]: 赤印の機能",
-        "3. [(-)] は負号（マイナス）入力（例: -3 は [(-)]→3）",
-        "4. [x10^] キーで×10のべき（科学表記）",
-        "5. [DEL] で1文字削除 / [AC] で行クリア",
-        "6. 小数点は [.] キー",
-        "7. F1〜F6 は画面下のソフトキー（表示に合わせて働きが変わる）",
-        "8. [EXIT] で一つ戻る、メニューに戻るまで数回押せばOK",
-        "9. どの決定も基本は [EXE]。入力のたびに [EXE] を押すのを忘れない"
-    ]
-    return "\n".join(guide)
-
-# ---------- 二次方程式 文字指示の解析 ----------
-def parse_quadratic_text(s: str) -> Optional[Tuple[float, float, float]]:
-    # 例: 「二次 1,-3,2」「二次1 -3 2」「二次 a=1 b=-3 c=2」「二次 1.-3.2」
-    if "二次" not in s:
-        return None
-    # a,b,c の明示がある場合
-    m = re.search(r"a\s*=\s*([+\-]?\d+(?:\.\d+)?)", s)
-    if m:
-        a = float(m.group(1))
-        mb = re.search(r"b\s*=\s*([+\-]?\d+(?:\.\d+)?)", s)
-        mc = re.search(r"c\s*=\s*([+\-]?\d+(?:\.\d+)?)", s)
-        if mb and mc:
-            return a, float(mb.group(1)), float(mc.group(1))
-    # 数だけ拾う（カンマ/スペース/全角混在OK）
-    nums = re.findall(r"[+\-]?\d+(?:\.\d+)?", s.replace("，", ",").replace("　", " "))
-    if len(nums) >= 3:
-        a, b, c = map(float, nums[:3])
-        return a, b, c
-    return None
-
-def solve_quadratic(a: float, b: float, c: float) -> Dict[str, Any]:
-    import math
-    D = b*b - 4*a*c
-    result: Dict[str, Any] = {"a": a, "b": b, "c": c, "D": D}
-    if D > 0:
-        r1 = (-b + math.sqrt(D)) / (2*a)
-        r2 = (-b - math.sqrt(D)) / (2*a)
-        kind = "実数解（異なる2解）"
-        ans = f"x1={r1}, x2={r2}"
-    elif D == 0:
-        r = (-b) / (2*a)
-        kind = "実数解（重解）"
-        ans = f"x={r}"
-    else:
-        # 複素数形表示
-        real = -b / (2*a)
-        imag = math.sqrt(-D) / (2*a)
-        kind = "複素数解"
-        ans = f"x={real}±{imag}i"
-    result.update({"kind": kind, "answer": ans})
-    return result
-
-# ---------- 画像前処理 ----------
-def preprocess_image(img_bytes: bytes) -> bytes:
-    img = Image.open(io.BytesIO(img_bytes))
-    # 200〜300%に拡大（短辺基準 1800px 目安）
-    w, h = img.size
-    scale = max(2.0, 1800 / min(w, h)) if min(w, h) < 1800 else 2.0
-    new = img.convert("RGB").resize((int(w*scale), int(h*scale)), Image.LANCZOS)
-    # グレースケール + コントラスト強化
-    new = ImageOps.grayscale(new)
-    new = ImageEnhance.Contrast(new).enhance(1.8)
-    buf = io.BytesIO()
-    new.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
-# ---------- Vision で問題抽出→解答→手順 ----------
-async def ask_openai_for_math(image_png: bytes) -> Optional[List[Dict[str, Any]]]:
-    """
-    画像から最大2問の『式 / 答え / fx-CG50手順(番号付き・EXE含む)』を JSON 厳格形式で返す。
-    失敗時は None。
-    """
-    if not OPENAI_API_KEY:
-        return None
-
-    b64 = base64.b64encode(image_png).decode("utf-8")
-    system_prompt = (
-        "You are a strict math solver and calculator-instructor for CASIO fx-CG50."
-        " Read the photo (Japanese possible). Extract up to 2 distinct sub-problems."
-        " For each, compute the final numeric answer (or simplest exact form)."
-        " Then output numbered key steps for CASIO fx-CG50 so that a student can reproduce"
-        " the answer. Every input confirmation must include [EXE]."
-        " If a problem is not suitable for direct calculator operation, still give the"
-        " correct answer and set steps to a short note like '手計算で求める' with 1–2 hints."
-        " Output STRICT JSON ONLY with this shape:\n"
-        "{ \"problems\":[ {"
-        "  \"title\":\"...\", \"equation\":\"...\", \"answer\":\"...\","
-        "  \"steps\":[\"1. ...\", \"2. ...\", ...] } ] }"
-    )
-    user_hint = (
-        "日本語で。式はそのままの体裁で。手順は1. 2. 3. の配列。"
-        " 例: 『MENU→EQUATION→POLY→次数2→a,b,c入力→EXE…』のようにEXE必須。"
-    )
-
-    payload = {
-        "model": OPENAI_MODEL_VISION,
-        "input": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [
-                {"type": "input_text", "text": user_hint},
-                {"type": "input_image", "image_data": b64, "mime_type": "image/png"}
-            ]}
-        ],
-        "max_output_tokens": 1200,
-        "temperature": 0.1
-    }
-
-    url = "https://api.openai.com/v1/responses"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    for attempt in range(2):
-        try:
-            with httpx.Client(timeout=45.0) as c:
-                r = c.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            text = data.get("output_text") or data.get("choices", [{}])[0].get("message", {}).get("content")
-            if not text:
-                # responses API は output[0].content[0].text のこともある
-                out = data.get("output", [])
-                if out and out[0].get("content"):
-                    text = out[0]["content"][0].get("text", "")
-            # JSONだけにする（前後のノイズ除去）
-            m = re.search(r"\{[\s\S]*\}", text)
-            if not m:
-                continue
-            obj = json.loads(m.group(0))
-            probs = obj.get("problems", [])
-            if probs:
-                # stepsが1. 2. ...で始まるか最終チェック
-                for p in probs:
-                    p["steps"] = [s if re.match(r"^\d+\.", s) else f"{i+1}. {s}"
-                                  for i, s in enumerate(p.get("steps", []))]
-                return probs[:2]
-        except Exception:
-            continue
-    return None
-
-# ---------- LINE 画像処理 ----------
-async def handle_image(message_id: str, user_id: str) -> str:
-    # 1) 画像取得（即時）。過去メッセージは404になるので注意。
-    content_url = f"https://api.line.me/v2/bot/message/{message_id}/content"
-    data: Optional[bytes] = None
-    async with httpx.AsyncClient(timeout=30.0) as ac:
-        for _ in range(2):
-            r = await ac.get(content_url, headers=line_headers(False))
-            if r.status_code == 200:
-                data = r.content
-                break
-    if not data:
-        return "画像の取得に失敗しました。もう一度、正面から明るく撮って送ってください。"
-
-    # 2) 前処理
-    pre = preprocess_image(data)
-
-    # 3) Visionで抽出→解答→手順
-    probs = await ask_openai_for_math(pre)
-    if not probs:
-        return "式を特定できませんでした。画面いっぱい・正面・影少なめで再送してください。"
-
-    # 4) 整形して返す
-    out_lines: List[str] = []
-    for idx, p in enumerate(probs, 1):
-        title = p.get("title") or f"問題{idx}"
-        eq = p.get("equation", "")
-        ans = p.get("answer", "")
-        steps = p.get("steps", []) or []
-        out_lines.append(f"◆{title}")
-        if eq:
-            out_lines.append(f"式: {eq}")
-        if ans:
-            out_lines.append(f"答え: {ans}")
-        if steps:
-            out_lines.append("手順:")
-            out_lines += [f"{s}" for s in steps]
-        out_lines.append("")  # 区切り
-
-    return "\n".join(out_lines).strip()
-
-# ---------- FastAPI ----------
+# ========= ルート =========
 @app.get("/")
 def root():
-    return ok()
+    return {"ok": True}
 
+# ========= Webhook =========
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(req: Request):
+    # Verify 対策：空/非JSONでも 200
     try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(ok("no json"))
-    # print("WEBHOOK:", body)  # デバッグ
+        body = await req.json()
+    except:
+        body = {}
+    print("Webhook:", body)
 
     events = body.get("events", [])
+    if not events:
+        return {"status":"ok","note":"no events"}
+
     for ev in events:
-        try:
-            etype = ev.get("type")
-            reply_token = ev.get("replyToken")
-            src = ev.get("source", {})
-            user_id = src.get("userId", "")
+        etype = ev.get("type")
+        reply_token = ev.get("replyToken")
+        src = ev.get("source", {})
+        user_id = src.get("userId")
 
-            if etype == "message":
-                msg = ev.get("message", {})
-                mtype = msg.get("type")
+        # ===== テキスト =====
+        if etype == "message" and ev.get("message", {}).get("type") == "text":
+            text = ev["message"]["text"].strip()
 
-                # ---- 画像 ----
-                if mtype == "image":
-                    # 先に「解析中…」返信 → 後からpush
-                    if reply_token:
-                        await line_reply(reply_token, [{"type": "text", "text": "解析中… 少し待ってね。"}])
-                    mid = msg.get("id")
-                    text = await handle_image(mid, user_id)
-                    if text and user_id:
-                        await line_push(user_id, [{"type": "text", "text": text}])
-                    continue
+            # 総合ガイド
+            if text == "操作方法":
+                for chunk in split_long_text(GUIDE):
+                    await line_reply(reply_token, [{"type":"text","text":chunk}])
+                continue
 
-                # ---- テキスト ----
-                if mtype == "text":
-                    t = msg.get("text", "").strip()
+            # 二次 a,b,c
+            coeffs = try_parse_quadratic(text)
+            if coeffs:
+                a,b,c = coeffs
+                kind, D, roots = solve_quadratic(a,b,c)
+                header = f"【二次方程式】a={a}, b={b}, c={c}\n判別式 D={D} → {kind}"
+                if roots:
+                    header += f"\n解: x1={roots[0]}, x2={roots[1]}"
+                msgs = [{"type":"text","text": header}]
+                equa, graph = build_operating_steps_for_quadratic(a,b,c)
+                msgs += [{"type":"text","text": "《EQUA》\n" + format_numbered(equa)}]
+                msgs += [{"type":"text","text": "《GRAPH》\n" + format_numbered(graph)}]
+                await line_reply(reply_token, msgs[:5])
+                continue
 
-                    # 総合ガイド
-                    if re.search(r"操作方法|ヘルプ|使い方", t):
-                        await line_reply(reply_token, [{"type": "text", "text": cg50_key_guide()}])
-                        continue
+            # その他：使い方ヒント
+            hint = "使い方：\n・画像を送る → 最大2問の『式/解/手順』を返します\n・「操作方法」→ 総合ガイド\n・「二次 a=1 b=-3 c=2」や「二次 1,-3,2」→ 解＋手順"
+            await line_reply(reply_token, [{"type":"text","text":hint}])
+            continue
 
-                    # 二次（各種表記）
-                    abc = parse_quadratic_text(t)
-                    if abc:
-                        a, b, c = abc
-                        info = solve_quadratic(a, b, c)
-                        steps = cg50_quadratic_steps(a, b, c)
-                        text = (
-                            f"【二次方程式 ax^2+bx+c=0】\n"
-                            f"a={a}, b={b}, c={c}\n"
-                            f"判別式 D={info['D']} → {info['kind']}\n"
-                            f"答え: {info['answer']}\n"
-                            "手順:\n" + "\n".join(steps)
-                        )
-                        await line_reply(reply_token, [{"type": "text", "text": text}])
-                        continue
+        # ===== 画像 =====
+        if etype == "message" and ev.get("message", {}).get("type") in ("image","file"):
+            mid = ev["message"]["id"]
+            # 先に即時返信（1秒制限回避）
+            await line_reply(reply_token, [{"type":"text","text":"解析中… 少し待ってね（最大2問まで抽出）"}])
 
-                    # それ以外は案内
-                    usage = (
-                        "使い方：\n"
-                        "1) 問題の写真を送る → 解析後『式＋答え＋番号付き手順』を返します（最大2問まで）\n"
-                        "2) 二次方程式なら『二次 a=1 b=-3 c=2』や『二次 1,-3,2』『二次1 -3 2』でも解＋手順を返します\n"
-                        "3) キー操作の一覧は『操作方法』と送信"
-                    )
-                    await line_reply(reply_token, [{"type": "text", "text": usage}])
-                    continue
-
-            # それ以外のイベントは無視
-        except Exception as e:
-            # 失敗しても 200 を返す（LINE再送を防ぐ）
+            # 画像取得
+            if not LINE_TOKEN:
+                if user_id:
+                    await line_push(user_id, [{"type":"text","text":"サーバの設定エラー：LINE トークン未設定"}])
+                continue
+            content_url = f"https://api-data.line.me/v2/bot/message/{mid}/content"
+            headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
             try:
-                if ev.get("replyToken"):
-                    await line_reply(ev["replyToken"], [{"type": "text", "text": f"内部エラーが発生しました。もう一度お試しください。"}])
-            except Exception:
-                pass
-            # print("handler error:", e)
+                async with httpx.AsyncClient(timeout=30) as c:
+                    r = await c.get(content_url, headers=headers)
+                    r.raise_for_status()
+                    raw = r.content
+            except Exception as e:
+                if user_id:
+                    await line_push(user_id, [{"type":"text","text":f"画像の取得に失敗しました: {e}"}])
+                continue
 
-    return JSONResponse(ok())
+            # 前処理→OpenAI Vision
+            try:
+                enhanced = pil_enhance_for_ocr(raw)
+                ai = await openai_extract_two_problems(enhanced)
+            except Exception as e:
+                if user_id:
+                    await line_push(user_id, [{"type":"text","text":f"内部エラー（前処理）: {e}"}])
+                continue
+
+            if ai.get("status") != "ok":
+                if user_id:
+                    detail = ai.get("detail","")
+                    await line_push(user_id, [{"type":"text","text":f"解析に失敗しました。コントラストを強めて再送してください。\n{detail[:200]}"}])
+                continue
+
+            probs = ai["data"].get("problems", [])[:2]
+            if not probs:
+                if user_id:
+                    await line_push(user_id, [{"type":"text","text":"式を特定できませんでした（最大2問）。余白を少なく、正面から撮って再送してね。"}])
+                continue
+
+            # 各問題を整形して送信
+            for p in probs:
+                title = p.get("id") or "(問題)"
+                latex = p.get("latex") or p.get("title") or ""
+                ans = p.get("answer") or ""
+                exp = p.get("explain") or ""
+                head = f"{title}\n[式] {latex}\n[答え] {ans}".strip()
+                await line_push(user_id, [{"type":"text","text": head}])
+
+                # 種別に応じて fx-CG50 手順生成（AI抽出の kind/params をなるべく使う）
+                steps = build_fx_steps_from_ai(p)
+                for chunk in split_long_text("《電卓手順》\n" + format_numbered(steps)):
+                    await line_push(user_id, [{"type":"text","text": chunk}])
+
+                if exp:
+                    for chunk in split_long_text("《考え方》\n" + exp):
+                        await line_push(user_id, [{"type":"text","text": chunk}])
+
+            continue
+
+    return {"status":"ok"}
+
