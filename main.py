@@ -210,6 +210,34 @@ def cg50_keyseq(expr: str) -> str:
     seq = seq.replace("sqrt", "[√]").replace("log10", "[LOG]10,").replace("log", "[LN]")
     seq = seq.replace("*", "×").replace("/", "÷").replace("**", "^")
     return "角度:Deg を確認 → 入力: " + seq + " → [EXE]"
+# ===== webhook内（イベントループ）のテキスト/画像分岐 =====
+elif msg_type == "text":
+    text = event["message"]["text"].strip()
+    if text.lower() == "ping":
+        reply_text = "pong ✅"
+    elif text.lower().startswith("calc:"):
+        expr = text[5:].strip()
+        try:
+            val = safe_calc(expr)
+            seq = cg50_keyseq(expr)
+            reply_text = f"計算OK ✅\n式: {expr}\n結果: {val}\n\nfx-CG50操作ガイド:\n{seq}"
+        except Exception as e:
+            reply_text = f"式の解析に失敗しました ❌\n入力例: calc: sin(30)+3^2\n詳細: {e}"
+    else:
+        reply_text = "受信しました。計算は `calc: ...` で送ってね。例: `calc: sin(30)+3^2`"
+    await reply_message(reply_token, [{"type":"text","text":reply_text}])
+    return JSONResponse({"status":"ok"})
+
+elif msg_type == "image":
+    # いったん“誤答を出さない”安全運用に固定
+    reply_text = (
+        "画像ありがとう！📷\n"
+        "まずはテキストで式を送ってね（例）\n"
+        "calc: sin(30)+3^2\n"
+        "※今は誤答防止のため、画像からの自動読取は一時停止中です。"
+    )
+    await reply_message(reply_token, [{"type":"text","text":reply_text}])
+    return JSONResponse({"status":"ok"})
 
 # ====== ルーティング ======
 @app.get("/")
@@ -223,4 +251,5 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     sig  = request.headers.get("x-line-signature", "")
     background_tasks.add_task(process_line_events, body, sig)
     return Response(status_code=200)
+
 
