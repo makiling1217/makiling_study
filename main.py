@@ -116,6 +116,24 @@ def cg50_keyseq(expr: str) -> str:
            .replace("**", "^").replace("*", "×").replace("/", "÷")
     )
     return "角度:Deg を確認 → 入力: " + seq + " → [EXE]"
+# ===== 入力正規化（全角→半角、×÷→*/、＾→^、（→( など） =====
+def normalize_expr(s: str) -> str:
+    # 全角英数記号→半角
+    zenkaku = "０１２３４５６７８９（）＊＋－／＾，．　"
+    hankaku = "0123456789()*/+-/^,. "
+    trans = str.maketrans(zenkaku, hankaku)
+    s = s.translate(trans)
+
+    # 日本語記号など
+    s = (s.replace("×", "*")
+           .replace("÷", "/")
+           .replace("π", "pi")
+           .replace("√", "sqrt("))  # 「√2」は sqrt(2) を想定 → 足りない ) はユーザ入力に依存
+    # スペース整理
+    s = re.sub(r"\s+", "", s)
+    # ^ を Python 演算子へ
+    s = s.replace("^", "**")
+    return s
 
 # ====== ルーティング ======
 @app.get("/")
@@ -205,5 +223,28 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
         except Exception:
             await reply_message(reply_token, [{"type": "text", "text": "内部エラーが発生しました。"}])
             logging.exception("Unhandled error")
+elif text.lower().startswith("calc:"):
+    raw = text[5:].strip()
+    if not raw:
+        await reply_message(reply_token, [{
+            "type":"text",
+            "text":"式が空です。例: calc: sin(30)+3^2\n使える関数: sin, cos, tan, asin, acos, atan, sqrt, log, log10, abs\n定数: pi, e（角度は度）"
+        }])
+        return
+
+    expr = normalize_expr(raw)
+    try:
+        val = safe_calc(expr)  # safe_calc は ** 対応済み
+        # 表示用は ^ に戻してあげると親切
+        shown = expr.replace("**","^")
+        seq = cg50_keyseq(shown)
+        msg = f"計算OK ✅\n式: {shown}\n結果: {val}\n\nfx-CG50操作ガイド:\n{seq}"
+    except Exception as e:
+        msg = ("式の解析に失敗しました ❌\n"
+               "入力例: calc: sin(30)+3^2\n"
+               "使える関数: sin, cos, tan, asin, acos, atan, sqrt, log, log10, abs\n"
+               f"詳細: {e}")
+    await reply_message(reply_token, [{"type":"text","text":msg}])
 
     return JSONResponse({"status": "ok"})
+
