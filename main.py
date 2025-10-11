@@ -1,4 +1,4 @@
-# main.py — LINE Bot: Image→(Preprocess)→ OCR (Mathpix optional / RapidOCR lazy) → Sympy CAS → Answer
+f# main.py — LINE Bot: Image→(Preprocess)→ OCR (Mathpix optional / RapidOCR lazy) → Sympy CAS → Answer
 import os, hmac, hashlib, base64, json, re, logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -367,7 +367,7 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
 
                 await reply_message(reply_token,[{"type":"text","text":"画像を送れば、問題文OCR＋式抽出＋厳密解＋電卓操作まで返します。"}])
                 continue
-
+raw = text[5:].strip()
             # ===== 画像 =====
             if msg_type == "image":
                 # 1) 画像取得
@@ -433,4 +433,5 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
 
