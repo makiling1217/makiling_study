@@ -370,6 +370,14 @@ if text.lower().startswith("prec:"):
                     try:
                         e = sym_parse(norm)
                         kind, expr, res = kind_eval_or_solve(e)
+                        # 既存: block = block_from_result(kind, expr, res)
+# ↓ 置き換え
+exact_str = str(sp.simplify(expr))
+approx_str = str(sp.N(expr, PREC["digits"]))  # 近似は現在の桁数で
+
+block = "[式]\n" + sp.srepr(expr) + \
+        f"\n厳密: {exact_str}\n近似({PREC['digits']}桁): {approx_str}"
+
                         block = block_from_result(kind, expr, res)
                         guide = keyseq_for_expr(expr)
                         await reply_long_text(reply_token, f"{block}\n\n{guide}")
@@ -445,6 +453,7 @@ if text.lower().startswith("prec:"):
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
 
 
 
