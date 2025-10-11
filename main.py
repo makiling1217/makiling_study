@@ -5,8 +5,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, Response
 import httpx
-# 近似表示の桁数（環境変数 PREC_DIGITS があればそれを使う）
-PREC = {"digits": int(os.environ.get("PREC_DIGITS", "6"))}
 
 # ====== 数式（Sympy） ======
 SYM_AVAILABLE = True
@@ -48,6 +46,7 @@ def get_rapid():
             logging.error(f"RapidOCR init failed: {e}")
     return rapid_ocr
 
+# ====== FastAPI ======
 app = FastAPI()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -59,8 +58,11 @@ MATHPIX_APP_KEY = os.environ.get("MATHPIX_APP_KEY", "")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{messageId}/content"
 
-# 角度モード（asin/acos/atanの返りを度/ラジアン切替）
+# 角度モード（asin/acos/atan の返りを度/ラジアン切替）
 ANGLE_MODE = {"mode": "deg"}  # "deg" or "rad"
+
+# 近似表示の桁数（環境変数で既定変更可）
+PREC = {"digits": int(os.environ.get("PREC_DIGITS", "6"))}
 
 # ====== ユーティリティ ======
 def verify_signature(secret: str, body: bytes, signature: str) -> bool:
@@ -101,33 +103,35 @@ _HK = "0123456789()*+-/^,. ijx"
 assert len(_ZK)==len(_HK), "maketrans length mismatch"
 TRANS = str.maketrans(_ZK, _HK)
 
-# --- 式の正規化（度→ラジアンに変換して安全に評価）---
+# --- 式の正規化（度→ラジアンを安定変換）---
 def normalize_expr(s: str) -> str:
-    # 全角→半角・基本置換
+    # まず基本の正規化
     s = s.translate(TRANS)
     s = s.replace("×","*").replace("÷","/").replace("−","-").replace("–","-")
     s = s.replace("π","pi")
 
-    # √n → sqrt(n)
+    # √n → sqrt(n
     s = re.sub(r"√\s*([0-9a-zA-Z_\(])", r"sqrt(\1", s)
 
-    # まず「関数の括弧省略」を先に補う（sin30 → sin(30) など）
+    # 関数の括弧省略（sin30 → sin(30) など）
     s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh|asin|acos|atan)\s*([0-9]+(?:\.[0-9]+)?)\b",
                r"\1(\2)", s, flags=re.I)
 
-    # --- 度表記（これ一本）---
-    # 30° / 45º / 30 deg / 30degrees / 30 Degree などを rad(30) に統一
-    s = re.sub(r"(\d+(?:\.\d+)?)\s*(?:°|º|deg|degree|degrees)\b", r"rad(\1)", s, flags=re.I)
+    # 度表記を一本化： 30°/30º/30 deg/30degrees → rad(30)
+    # 先に全てのバリアント記号を通常の度記号に統一
+    s = s.replace("º", "°")
+    # 数字 + [空白] + (° or 単語)
+    s = re.sub(r"(\d+(?:\.\d+)?)\s*(?:°|deg|degree|degrees)\b", r"rad(\1)", s, flags=re.I)
+    # 念のため、残った単独の度記号は削除（解析エラー回避）
+    s = s.replace("°", "")
 
     # 虚数 i/j → I
     s = re.sub(r"\b([0-9\.]+)[ij]\b", r"\1*I", s, flags=re.I)
     s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
 
-    # 演算子 / 空白
     s = s.replace("^","**")
     s = re.sub(r"\s+","", s)
     return s
-
 
 # ====== Sympy 準備 ======
 if SYM_AVAILABLE:
@@ -157,8 +161,8 @@ if SYM_AVAILABLE:
         "asin": asin_mode, "acos": acos_mode, "atan": atan_mode,
         "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
         "Matrix": sp.Matrix,
+        # 度→ラジアン（normalize で rad(30) に統一）
         "rad": (lambda x: x*sp.pi/180),
-
     }
 
     TRANSFORMS = (standard_transformations
@@ -279,15 +283,6 @@ def kind_eval_or_solve(e: 'sp.Expr') -> Tuple[str, 'sp.Expr', Optional['sp.Expr'
     except Exception:
         return "skip", e, None
 
-def block_from_result(kind: str, expr: 'sp.Expr', res: Optional['sp.Expr']) -> str:
-    if kind == "solve": return f"[方程式]\n{sp.srepr(expr)}\n解: {res}"
-    if kind == "eval":  return f"[式]\n{sp.srepr(expr)}\n結果: {res}"
-    return f"[式]\n{sp.srepr(expr)}\n結果: <解析不可>"
-
-def keyseq_for_expr(expr: 'sp.Expr') -> str:
-    shown = str(sp.simplify(expr)).replace("**","^")
-    return "fx-CG50 操作ガイド\n" + cg50_keyseq(shown)
-
 # ====== ルート & 健康確認 ======
 @app.get("/")
 async def root():
@@ -295,7 +290,8 @@ async def root():
             "sympy": SYM_AVAILABLE,
             "latex_parser": HAS_PARSE_LATEX,
             "rapid_imported": RAPID_IMPORTED,
-            "mathpix_keys": bool(MATHPIX_APP_ID and MATHPIX_APP_KEY)}
+            "mathpix_keys": bool(MATHPIX_APP_ID and MATHPIX_APP_KEY),
+            "prec_digits": PREC["digits"]}
     logging.info(f"Startup info: {info}")
     return info
 
@@ -337,16 +333,6 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             # ===== テキスト =====
             if msg_type == "text":
                 text = (m.get("text") or "").strip()
-                # 近似桁数の変更: 例) prec: 8
-if text.lower().startswith("prec:"):
-    try:
-        n = int(text.split(":",1)[1].strip())
-        n = max(1, min(50, n))   # 1〜50に制限
-        PREC["digits"] = n
-        await reply_message(reply_token, [{"type":"text","text":f"近似表示桁数: {n} 桁"}])
-    except Exception:
-        await reply_message(reply_token, [{"type":"text","text":"prec: の後に 1〜50 の整数を指定してください。"}])
-    continue
 
                 # 角度モード
                 if text.lower().startswith("mode:"):
@@ -359,6 +345,16 @@ if text.lower().startswith("prec:"):
                         await reply_message(reply_token,[{"type":"text","text":"角度モード: Rad"}]); continue
                     await reply_message(reply_token,[{"type":"text","text":"mode:deg / mode:rad"}]); continue
 
+                # 近似桁数
+                if text.lower().startswith("prec:"):
+                    try:
+                        n = int(text.split(":",1)[1].strip())
+                        n = max(1, min(50, n))
+                        PREC["digits"] = n
+                        await reply_message(reply_token,[{"type":"text","text":f"近似表示桁数: {n} 桁"}]); continue
+                    except Exception:
+                        await reply_message(reply_token,[{"type":"text","text":"prec: の後に 1〜50 の整数を指定してください。"}]); continue
+
                 # 計算
                 if text.lower().startswith("calc:"):
                     if not SYM_AVAILABLE:
@@ -366,21 +362,17 @@ if text.lower().startswith("prec:"):
                     raw = text[5:].strip()
                     if not raw:
                         await reply_message(reply_token,[{"type":"text","text":"式が空です。例: calc: sin30° + 3^2"}]); continue
+
                     norm = normalize_expr(raw)
                     try:
-                        e = sym_parse(norm)
-                        kind, expr, res = kind_eval_or_solve(e)
-                        # 既存: block = block_from_result(kind, expr, res)
-# ↓ 置き換え
-exact_str = str(sp.simplify(expr))
-approx_str = str(sp.N(expr, PREC["digits"]))  # 近似は現在の桁数で
-
-block = "[式]\n" + sp.srepr(expr) + \
-        f"\n厳密: {exact_str}\n近似({PREC['digits']}桁): {approx_str}"
-
-                        block = block_from_result(kind, expr, res)
-                        guide = keyseq_for_expr(expr)
-                        await reply_long_text(reply_token, f"{block}\n\n{guide}")
+                        expr = sym_parse(norm)
+                        # 厳密と近似
+                        exact_str = str(sp.simplify(expr)).replace("**","^")
+                        approx_str = str(sp.N(expr, PREC["digits"]))
+                        shown = str(sp.srepr(expr))
+                        guide = cg50_keyseq(exact_str)
+                        msg = f"[式]\n{shown}\n厳密: {exact_str}\n近似({PREC['digits']}桁): {approx_str}\n\nfx-CG50 操作ガイド\n{guide}"
+                        await reply_long_text(reply_token, msg)
                     except Exception as ex:
                         await reply_long_text(reply_token, f"解析失敗: {ex}\n入力: {raw}")
                     continue
@@ -429,10 +421,11 @@ block = "[式]\n" + sp.srepr(expr) + \
                         if e_sym is None:
                             answers.append(f"#{idx}\n抽出: {shown}\n→ 解析不可")
                             continue
-                        kind, expr, res = kind_eval_or_solve(e_sym)
-                        block = block_from_result(kind, expr, res)
-                        guide = keyseq_for_expr(expr)
-                        answers.append(f"#{idx}\n抽出: {shown}\n{block}\n\n{guide}")
+                        # 厳密と近似
+                        exact_str = str(sp.simplify(e_sym)).replace("**","^")
+                        approx_str = str(sp.N(e_sym, PREC["digits"]))
+                        guide = cg50_keyseq(exact_str)
+                        answers.append(f"#{idx}\n抽出: {shown}\n厳密: {exact_str}\n近似({PREC['digits']}桁): {approx_str}\n\nfx-CG50 操作ガイド\n{guide}")
                     if answers:
                         expr_blocks.append("\n\n".join(answers))
                 else:
@@ -453,7 +446,3 @@ block = "[式]\n" + sp.srepr(expr) + \
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
-
-
-
-
