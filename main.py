@@ -406,3 +406,10 @@ async def envcheck():
     sec = os.environ.get("LINE_CHANNEL_SECRET","")
     def mask(s): return f"{len(s)} chars : {s[:6]}...{s[-6:]}" if s else "(empty)"
     return {"access_token": mask(tok), "channel_secret": mask(sec)}
+@app.get("/envcheck")
+async def envcheck():
+    import os
+    tok = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN","")
+    def mask(s): return f"{len(s)} chars : {s[:6]}...{s[-6:]}" if s else "(empty)"
+    return {"access_token": mask(tok)}
+
