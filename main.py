@@ -1,12 +1,12 @@
-# main.py — LINE Bot: OCR(optional) + Sympy CAS + 電卓手順
-import os, hmac, hashlib, base64, json, re, logging
+# main.py — LINE Bot: OCR(optional) + Sympy CAS + 電卓手順（堅牢化版）
+import os, hmac, hashlib, base64, json, re, logging, traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, Response
 import httpx
 
-# ====== 数式（Sympy） ======
+# ====== Sympy (CAS) ======
 SYM_AVAILABLE = True
 try:
     import sympy as sp
@@ -61,8 +61,11 @@ LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{messageId}/content"
 # 角度モード（asin/acos/atan の返りを度/ラジアン切替）
 ANGLE_MODE = {"mode": "deg"}  # "deg" or "rad"
 
-# 近似表示の桁数（環境変数で既定変更可）
+# 近似表示の桁数
 PREC = {"digits": int(os.environ.get("PREC_DIGITS", "6"))}
+
+# 直近エラー保存（診断用）
+LAST_ERROR = {"msg": None, "trace": None}
 
 # ====== ユーティリティ ======
 def verify_signature(secret: str, body: bytes, signature: str) -> bool:
@@ -113,14 +116,14 @@ def normalize_expr(s: str) -> str:
     # √n → sqrt(n
     s = re.sub(r"√\s*([0-9a-zA-Z_\(])", r"sqrt(\1", s)
 
-    # 余分な空白を一旦 1個に
+    # 余分な空白を1個に
     s = re.sub(r"\s+", " ", s)
 
-    # 1) f(… )° → f(rad(…))  （sin(30)° の形）
+    # 1) f(… )° → f(rad(…))  （sin(30)°）
     s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*\(\s*([^()]+?)\s*\)\s*°",
                r"\1(rad(\2))", s, flags=re.I)
 
-    # 2) f 数字° → f(rad(数字))  （sin30° の形）
+    # 2) f 数字° → f(rad(数字))  （sin30°）
     s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*([0-9]+(?:\.[0-9]+)?)\s*°",
                r"\1(rad(\2))", s, flags=re.I)
 
@@ -128,18 +131,15 @@ def normalize_expr(s: str) -> str:
     s = re.sub(r"(\d+(?:\.\d+)?)\s*(?:°|deg|degree|degrees)\b",
                r"rad(\1)", s, flags=re.I)
 
-    # 4) 括弧省略の trig を補完（度記号なしの sin30 → sin(30) など）
+    # 4) 関数の括弧省略（sin30 → sin(30) など）
     s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh|asin|acos|atan)\s*([0-9]+(?:\.[0-9]+)?)\b",
                r"\1(\2)", s, flags=re.I)
 
     # 5) 暗黙の掛け算を明示化
-    #   数字 or ')' の直後に関数名が来たら '*' を挿入
     s = re.sub(r"(?<=[0-9\)])\s*(?=(?:sin|cos|tan|sinh|cosh|tanh|asin|acos|atan|sqrt|rad)\s*\()",
                "*", s, flags=re.I)
-    #   数字の直後に英字が来たら '*'（2x, 3pi 等）
-    s = re.sub(r"(?<=\d)\s*(?=[A-Za-z])", "*", s)
-    #   ')' の直後に数字 or 英字が来たら '*'（)( くっつき）
-    s = re.sub(r"(?<=\))\s*(?=[0-9A-Za-z])", "*", s)
+    s = re.sub(r"(?<=\d)\s*(?=[A-Za-z])", "*", s)          # 2x, 3pi
+    s = re.sub(r"(?<=\))\s*(?=[0-9A-Za-z])", "*", s)       # )( くっつき
 
     # 6) べき
     s = s.replace("^", "**")
@@ -149,7 +149,7 @@ def normalize_expr(s: str) -> str:
     s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
 
     # 8) 最終整形
-    s = s.replace(" ", "").replace("°","")  # ここまでで rad 化済みのはず
+    s = s.replace(" ", "").replace("°","")  # ここまでで rad 化済みの想定
     return s
 
 # ====== Sympy 準備 ======
@@ -158,7 +158,6 @@ if SYM_AVAILABLE:
     def nCr(n,r): return sp.binomial(n,r)
     def nPr(n,r): return sp.factorial(n)/sp.factorial(n-r)
 
-    # asin/acos/atan は角度モードで度に戻す
     def asin_mode(x): 
         y = sp.asin(x)
         return y if ANGLE_MODE["mode"]=="rad" else _rad2deg(y)
@@ -180,7 +179,6 @@ if SYM_AVAILABLE:
         "asin": asin_mode, "acos": acos_mode, "atan": atan_mode,
         "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
         "Matrix": sp.Matrix,
-        # 度→ラジアン（normalize で rad(…) に統一）
         "rad": (lambda x: x*sp.pi/180),
     }
 
@@ -262,7 +260,7 @@ def extract_latex(mp: Dict[str, Any]) -> List[str]:
     if isinstance(mp.get("latex_simplified"), str) and mp["latex_simplified"].strip():
         exprs.append(mp["latex_simplified"].strip())
     text = (mp.get("text") or "")
-    for pat in [r"\$(.+?)\$", r"\\\((.+?))\\\)", r"\\\[(.+?)\\\]"]:
+    for pat in [r"\$(.+?)\$", r"\\\((.+?)\\\)", r"\\\[(.+?))\\\]"]:
         for m in re.finditer(pat, text, flags=re.S):
             exprs.append(m.group(1))
     uniq = []
@@ -299,7 +297,6 @@ async def root():
     logging.info(f"Startup info: {info}")
     return info
 
-# デバッグ：正規化だけを確認
 @app.get("/calc_test")
 async def calc_test(expr: str):
     n = normalize_expr(expr)
@@ -318,6 +315,10 @@ async def envcheck():
     sec = os.environ.get("LINE_CHANNEL_SECRET","")
     def mask(s): return f"{len(s)} chars : {s[:6]}...{s[-6:]}" if s else "(empty)"
     return {"access_token": mask(tok), "channel_secret": mask(sec)}
+
+@app.get("/last_error")
+async def last_error():
+    return LAST_ERROR
 
 # ====== Webhook ======
 @app.post("/webhook")
@@ -373,18 +374,20 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
                     if not raw:
                         await reply_message(reply_token,[{"type":"text","text":"式が空です。例: calc: sin30° + 3^2"}]); continue
 
-                    norm = normalize_expr(raw)
                     try:
+                        norm = normalize_expr(raw)
                         expr = sym_parse(norm)
-                        # 厳密と近似
                         exact_str = str(sp.simplify(expr)).replace("**","^")
                         approx_str = str(sp.N(expr, PREC["digits"]))
                         shown = str(sp.srepr(expr))
                         guide = cg50_keyseq(exact_str)
                         msg = f"[式]\n{shown}\n厳密: {exact_str}\n近似({PREC['digits']}桁): {approx_str}\n\nfx-CG50 操作ガイド\n{guide}"
                         await reply_long_text(reply_token, msg)
-                    except Exception as ex:
-                        await reply_long_text(reply_token, f"解析失敗: {ex}\n入力: {raw}\n正規化: {norm}")
+                    except Exception as ex_calc:
+                        LAST_ERROR["msg"] = f"{type(ex_calc).__name__}: {ex_calc}"
+                        LAST_ERROR["trace"] = traceback.format_exc(limit=5)
+                        logging.exception("calc error")
+                        await reply_long_text(reply_token, f"解析失敗: {ex_calc}\n入力: {raw}\n正規化: {normalize_expr(raw)}")
                     continue
 
                 await reply_message(reply_token,[{"type":"text","text":"画像を送れば、問題文OCR＋式抽出＋厳密解＋電卓操作まで返します。"}])
@@ -392,7 +395,6 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
 
             # ===== 画像 =====
             if msg_type == "image":
-                # 画像取得
                 cp = m.get("contentProvider") or {}
                 if cp.get("type") == "external" and cp.get("originalContentUrl"):
                     async with httpx.AsyncClient(timeout=30) as ac:
@@ -401,17 +403,16 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
                 else:
                     img_raw = await get_line_image_bytes(m.get("id"))
 
-                # 前処理
                 try:
                     bw, gray = preprocess(img_raw)
                 except Exception as ex:
+                    LAST_ERROR["msg"] = f"preprocess: {ex}"
+                    LAST_ERROR["trace"] = traceback.format_exc(limit=5)
                     await reply_long_text(reply_token, f"画像前処理に失敗: {ex}")
                     continue
 
-                # 問題文OCR（RapidOCR）
                 text_ocr = rapid_ocr_text(gray)
 
-                # 数式OCR（Mathpixがあるときのみ）
                 expr_blocks: List[str] = []
                 if SYM_AVAILABLE:
                     latex_list: List[str] = []
@@ -448,11 +449,20 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             await reply_message(reply_token,[{"type":"text","text":f"未対応メッセージタイプ: {msg_type}"}])
 
         except httpx.HTTPStatusError as he:
-            await reply_message(reply_token,[{"type":"text","text":f"HTTPエラー: {he.response.status_code}"}])
+            LAST_ERROR["msg"] = f"HTTPStatusError: {he.response.status_code}"
+            LAST_ERROR["trace"] = traceback.format_exc(limit=5)
             logging.exception("HTTPStatusError")
+            try:
+                await reply_message(reply_token,[{"type":"text","text":f"HTTPエラー: {he.response.status_code}"}])
+            except Exception:
+                pass
         except Exception as ex:
-            await reply_message(reply_token,[{"type":"text","text":f"内部エラー: {ex}"}])
+            LAST_ERROR["msg"] = f"{type(ex).__name__}: {ex}"
+            LAST_ERROR["trace"] = traceback.format_exc(limit=5)
             logging.exception("Unhandled error")
+            try:
+                await reply_message(reply_token,[{"type":"text","text":f"内部エラー: {ex}"}])
+            except Exception:
+                pass
 
     return JSONResponse({"status":"ok"})
-
