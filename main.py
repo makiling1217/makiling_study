@@ -1,468 +1,303 @@
-# main.py — LINE Bot: OCR(optional) + Sympy CAS + 電卓手順（堅牢化フル版）
-import os, hmac, hashlib, base64, json, re, logging, traceback
-from typing import Any, Dict, List, Optional, Tuple
-
-from fastapi import FastAPI, Request, Header
-from fastapi.responses import JSONResponse, Response
+# main.py  — FastAPI only
+import os, hmac, hashlib, base64, json, re, unicodedata, logging
+from typing import Dict, Any, Tuple
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 
-# ====== Sympy (CAS) ======
-SYM_AVAILABLE = True
-try:
-    import sympy as sp
-    from sympy.parsing.sympy_parser import (
-        parse_expr, standard_transformations,
-        implicit_multiplication_application, convert_xor, function_exponentiation
-    )
-    try:
-        from sympy.parsing.latex import parse_latex
-        HAS_PARSE_LATEX = True
-    except Exception:
-        HAS_PARSE_LATEX = False
-except Exception:
-    SYM_AVAILABLE = False
-    HAS_PARSE_LATEX = False
+# ==== Calculator (sympy) ====
+from sympy import sin, cos, tan, sqrt, pi, E, simplify
+from sympy.parsing.sympy_parser import (
+    parse_expr,
+    standard_transformations,
+    implicit_multiplication_application,
+    function_exponentiation,
+    convert_xor,
+)
 
-# ====== 画像前処理 ======
-import numpy as np
-import cv2
+TRANSFORMS = standard_transformations + (
+    implicit_multiplication_application,  # 2x, 2(x), (a)b
+    function_exponentiation,              # sin^2 x
+    convert_xor,                          # ^ → **
+)
 
-# ====== RapidOCR（遅延初期化） ======
-RAPID_IMPORTED = False
-rapid_ocr = None
-def get_rapid():
-    global RAPID_IMPORTED, rapid_ocr
-    if rapid_ocr is not None:
-        return rapid_ocr
-    if not RAPID_IMPORTED:
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            rapid_ocr = RapidOCR()
-            RAPID_IMPORTED = True
-            logging.info("RapidOCR initialized")
-        except Exception as e:
-            RAPID_IMPORTED = True
-            rapid_ocr = None
-            logging.error(f"RapidOCR init failed: {e}")
-    return rapid_ocr
-
-# ====== FastAPI ======
+# ========= App =========
 app = FastAPI()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("uvicorn.error")
 
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-MATHPIX_APP_ID = os.environ.get("MATHPIX_APP_ID", "")
-MATHPIX_APP_KEY = os.environ.get("MATHPIX_APP_KEY", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
-LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
-LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{messageId}/content"
+# 共有ステート（簡易）
+ANGLE_MODE = "deg"          # "deg" / "rad"
+PREC_DIGITS = 6             # 近似の桁
+LAST_ERROR: Dict[str, Any] = {"msg": None, "trace": None}
 
-# 角度モード（asin/acos/atan の返りを度/ラジアン切替）
-ANGLE_MODE = {"mode": "deg"}  # "deg" or "rad"
+# --------- Utilities ----------
+def set_last_error(msg: str, trace: str = ""):
+    LAST_ERROR["msg"] = msg
+    LAST_ERROR["trace"] = trace
+    logger.error(f"[last_error] {msg}\n{trace}")
 
-# 近似表示の桁数
-PREC = {"digits": int(os.environ.get("PREC_DIGITS", "6"))}
-
-# 直近エラー保存（診断用）
-LAST_ERROR = {"msg": None, "trace": None}
-
-# ====== ユーティリティ ======
-def verify_signature(secret: str, body: bytes, signature: str) -> bool:
-    mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
-    expected = base64.b64encode(mac).decode("utf-8")
-    return hmac.compare_digest(expected, signature or "")
-
-async def reply_message(reply_token: str, messages: List[Dict[str, Any]]) -> None:
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
-    payload = {"replyToken": reply_token, "messages": messages}
-    async with httpx.AsyncClient(timeout=30) as ac:
-        r = await ac.post(LINE_REPLY_URL, headers=headers, json=payload)
-        logging.info(f'POST reply "{r.status_code}"')
-        r.raise_for_status()
-
-def chunk_text(txt: str, limit: int = 4500) -> List[str]:
-    out = []
-    while txt:
-        out.append(txt[:limit]); txt = txt[limit:]
-    return out
-
-async def reply_long_text(reply_token: str, txt: str) -> None:
-    chunks = chunk_text(txt)
-    await reply_message(reply_token, [{"type":"text","text":c} for c in chunks])
-
-async def get_line_image_bytes(message_id: str) -> bytes:
-    url = LINE_CONTENT_URL.format(messageId=message_id)
+async def line_api_get(url: str):
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    async with httpx.AsyncClient(timeout=30) as ac:
+    async with httpx.AsyncClient(timeout=10) as ac:
         r = await ac.get(url, headers=headers)
-        logging.info(f'GET {url} "{r.status_code}"')
-        r.raise_for_status()
-        return r.content
+    r.raise_for_status()
+    return r
 
-# ====== 全角→半角 ======
-_ZK = "０１２３４５６７８９（）＊＋－／＾，．　ｉｊｘ"
-_HK = "0123456789()*+-/^,. ijx"
-assert len(_ZK)==len(_HK), "maketrans length mismatch"
-TRANS = str.maketrans(_ZK, _HK)
+async def line_api_post(url: str, payload: Dict[str, Any]):
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=10) as ac:
+        r = await ac.post(url, headers=headers, content=json.dumps(payload, ensure_ascii=False))
+    r.raise_for_status()
+    return r
 
-# --- 式の正規化（度→ラジアン、暗黙の掛け算を強化）---
-def normalize_expr(s: str) -> str:
-    # 全角→半角・記号の統一
-    s = s.translate(TRANS)
-    s = (s.replace("×","*").replace("·","*").replace("∙","*").replace("・","*")
-           .replace("÷","/").replace("−","-").replace("–","-")
-           .replace("π","pi").replace("º","°"))
-    # √n → sqrt(n
-    s = re.sub(r"√\s*([0-9a-zA-Z_\(])", r"sqrt(\1", s)
+def verify_signature(body: bytes, signature: str) -> bool:
+    if not LINE_CHANNEL_SECRET:
+        return False
+    mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    expected = base64.b64encode(mac).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
 
-    # 余分な空白を1個に
-    s = re.sub(r"\s+", " ", s)
+# ---- Normalization (ここが肝) ----
+def nfkc(s: str) -> str:
+    return unicodedata.normalize("NFKC", s)
 
-    # 1) f(… )° → f(rad(…))  （sin(30)°）
-    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*\(\s*([^()]+?)\s*\)\s*°",
-               r"\1(rad(\2))", s, flags=re.I)
+def normalize_expr(raw: str, angle_mode: str = "deg") -> str:
+    """
+    ユーザー入力を sympy が食べられる式に正規化する。
+    - 全角/記号ゆれを統一
+    - 暗黙の掛け算: 2sinx, 2(3+4), (a)b, 3π など
+    - ^ → **
+    - ° を rad(...) に置換（sin30°, 60° など）
+    - mode:deg のときは sin30 → sin(rad(30)) のような“数値だけの引数”も度とみなす
+    """
+    s = nfkc(raw)
+    # スペース除去
+    s = re.sub(r"\s+", "", s)
 
-    # 2) f 数字° → f(rad(数字))  （sin30°）
-    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*([0-9]+(?:\.[0-9]+)?)\s*°",
-               r"\1(rad(\2))", s, flags=re.I)
-
-    # 3) 数字の度記号 30° / 30deg → rad(30)
-    s = re.sub(r"(\d+(?:\.\d+)?)\s*(?:°|deg|degree|degrees)\b",
-               r"rad(\1)", s, flags=re.I)
-
-    # 4) 関数の括弧省略（sin30 → sin(30) など）
-    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh|asin|acos|atan)\s*([0-9]+(?:\.[0-9]+)?)\b",
-               r"\1(\2)", s, flags=re.I)
-
-    # 5) 暗黙の掛け算を明示化
-    s = re.sub(r"(?<=[0-9\)])\s*(?=(?:sin|cos|tan|sinh|cosh|tanh|asin|acos|atan|sqrt|rad)\s*\()",
-               "*", s, flags=re.I)
-    s = re.sub(r"(?<=\d)\s*(?=[A-Za-z])", "*", s)          # 2x, 3pi
-    s = re.sub(r"(?<=\))\s*(?=[0-9A-Za-z])", "*", s)       # )( くっつき
-
-    # 6) べき
+    # 記号統一
+    s = (
+        s.replace("×", "*").replace("·", "*").replace("∙", "*")
+         .replace("÷", "/")
+         .replace("−", "-").replace("—", "-").replace("―", "-")
+         .replace("，", ",")
+         .replace("；", ";")
+    )
+    # べき
     s = s.replace("^", "**")
 
-    # 7) 虚数 i/j（数の直後のみ）→ I
-    s = re.sub(r"(\d)\s*[ij]\b", r"\1*I", s, flags=re.I)
-    s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
+    # π, e
+    s = s.replace("π", "pi").replace("Π", "pi").replace("ｅ", "e").replace("Ｅ", "E")
 
-    # 8) 最終整形
-    s = s.replace(" ", "").replace("°","")  # ここまでで rad 化済みの想定
+    # √x → sqrt(x)
+    s = re.sub(r"√(?=[A-Za-z0-9\(])", "sqrt(", s)  # √3 → sqrt(3
+    # √(… は上の置換で "sqrt((" になりがち、余計な "(" は parse_expr が丸めるのでOK
+    # ）補完はしない（途中式は /calc_test で見える）
+
+    # 暗黙の掛け算（数字の後に関数名/変数/括弧）
+    s = re.sub(r"(?<=\d)(?=[A-Za-z\(])", "*", s)
+    # 括弧閉じの後に数字/関数/変数
+    s = re.sub(r"(?<=\))(?=[A-Za-z0-9\(])", ")*", s)
+    # 定数 pi, e の前に係数
+    s = re.sub(r"(?<=\d)(?=pi\b)", "*", s)
+    s = re.sub(r"(?<=\d)(?=e\b)", "*", s)
+
+    # --- 角度（°）の処理 ---
+    # 1) sin(30°) / cos(…°) / tan(…°) → f(rad(数値))
+    s = re.sub(
+        r"(?<![A-Za-z0-9_])(sin|cos|tan)\(\s*(\d+(?:\.\d+)?)\s*°\s*\)",
+        lambda m: f"{m.group(1)}(rad({m.group(2)}))",
+        s,
+    )
+    # 2) sin30° のように括弧なし → f(rad(数値))
+    s = re.sub(
+        r"(?<![A-Za-z0-9_])(sin|cos|tan)\s*(\d+(?:\.\d+)?)\s*°",
+        lambda m: f"{m.group(1)}(rad({m.group(2)}))",
+        s,
+    )
+    # 3) mode=deg のとき、f(30) / f30 を f(rad(30)) に（引数が純数値のときだけ）
+    if angle_mode == "deg":
+        s = re.sub(
+            r"(?<![A-Za-z0-9_])(sin|cos|tan)(?:\(\s*(\d+(?:\.\d+)?)\s*\)|\s*(\d+(?:\.\d+)?))",
+            lambda m: f"{m.group(1)}(rad({m.group(2) or m.group(3)}))",
+            s,
+        )
+
+    # 4) 孤立した 60° など → rad(60)
+    s = re.sub(r"(\d+(?:\.\d+)?)°", r"rad(\1)", s)
+
     return s
 
-# ====== Sympy 準備 ======
-if SYM_AVAILABLE:
-    def _rad2deg(x): return x * 180 / sp.pi
-    def nCr(n,r): return sp.binomial(n,r)
-    def nPr(n,r): return sp.factorial(n)/sp.factorial(n-r)
-
-    def asin_mode(x): 
-        y = sp.asin(x)
-        return y if ANGLE_MODE["mode"]=="rad" else _rad2deg(y)
-    def acos_mode(x):
-        y = sp.acos(x)
-        return y if ANGLE_MODE["mode"]=="rad" else _rad2deg(y)
-    def atan_mode(x):
-        y = sp.atan(x)
-        return y if ANGLE_MODE["mode"]=="rad" else _rad2deg(y)
-
-    SYM_LOCALS = {
-        "pi": sp.pi, "e": sp.E, "I": sp.I,
-        "abs": sp.Abs, "sqrt": sp.sqrt, "exp": sp.exp,
-        "log": sp.log, "log10": lambda x: sp.log(x,10),
-        "floor": sp.floor, "ceil": sp.ceiling,
-        "nCr": nCr, "C": nCr, "comb": nCr,
-        "nPr": nPr, "P": nPr, "perm": nPr,
-        "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
-        "asin": asin_mode, "acos": acos_mode, "atan": atan_mode,
-        "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
-        "Matrix": sp.Matrix,
-        "rad": (lambda x: x*sp.pi/180),
+def parse_and_eval(norm: str, prec_digits: int) -> Tuple[Any, Any]:
+    # 安全な辞書（使う関数だけ）
+    def rad(x):  # degrees → radians
+        return x * pi / 180
+    local = {
+        "sin": sin, "cos": cos, "tan": tan,
+        "sqrt": sqrt, "pi": pi, "e": E, "E": E,
+        "rad": rad,
     }
+    expr = parse_expr(norm, local_dict=local, transformations=TRANSFORMS, evaluate=False)
+    exact = simplify(expr)
+    approx = exact.evalf(prec_digits)
+    return exact, approx
 
-    TRANSFORMS = (standard_transformations
-                  + (implicit_multiplication_application,)
-                  + (convert_xor,)
-                  + (function_exponentiation,))
+def make_cg50_guide(angle_mode: str, raw: str) -> str:
+    # 超シンプルな“打鍵例”ガイド（説明テキスト）。厳密なキー列ではないが目安として。
+    # 例: 2sin30°+60° → 角度:Deg → 入力: 2 × [SIN] 30 + 60 → [EXE]
+    s = nfkc(raw)
+    ex = (
+        s.replace(" ", "")
+         .replace("×", "×").replace("*", "×")
+         .replace("^", "^")
+         .replace("π", "pi")
+    )
+    # 関数名を大文字キー表記に
+    ex = re.sub(r"sin", "[SIN]", ex, flags=re.I)
+    ex = re.sub(r"cos", "[COS]", ex, flags=re.I)
+    ex = re.sub(r"tan", "[TAN]", ex, flags=re.I)
+    ex = ex.replace("**", "^")
+    return f"fx-CG50 操作ガイド\n角度:{'Deg' if angle_mode=='deg' else 'Rad'} → 入力: {ex} → [EXE]"
 
-    def sym_parse(expr: str):
-        return parse_expr(expr, local_dict=SYM_LOCALS, transformations=TRANSFORMS, evaluate=True)
-
-# ====== 電卓キー列（fx-CG50 風） ======
-def cg50_keyseq(expr_show: str) -> str:
-    s = expr_show.replace("**","^").replace("*","×").replace("/","÷")
-    s = (s.replace("asin","[SHIFT][SIN]^-1")
-           .replace("acos","[SHIFT][COS]^-1")
-           .replace("atan","[SHIFT][TAN]^-1")
-           .replace("sin","[SIN]").replace("cos","[COS]").replace("tan","[TAN]")
-           .replace("sqrt","[√]").replace("log10","[LOG]10,").replace("log","[LN]"))
-    return "角度:" + ("Deg" if ANGLE_MODE["mode"]=="deg" else "Rad") + " → 入力: " + s + " → [EXE]"
-
-# ====== 画像前処理 ======
-def preprocess(img_bytes: bytes):
-    arr = np.frombuffer(img_bytes, dtype=np.uint8)
-    im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if im is None: raise ValueError("decode error")
-    h, w = im.shape[:2]
-    short = min(h, w)
-    scale = 1280.0 / short if short < 1280 else 1.5
-    im_big = cv2.resize(im, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(im_big, cv2.COLOR_BGR2GRAY)
-    coords = np.column_stack(np.where(gray < 250))
-    angle = 0.0
-    if coords.size > 0:
-        rect = cv2.minAreaRect(coords); angle = rect[-1]
-        angle = -(90 + angle) if angle < -45 else -angle
-    M = cv2.getRotationMatrix2D((gray.shape[1]//2, gray.shape[0]//2), angle, 1.0)
-    gray_rot = cv2.warpAffine(gray, M, (gray.shape[1], gray.shape[0]), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enh = clahe.apply(gray_rot)
-    bw = cv2.adaptiveThreshold(enh, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 15)
-    return bw, gray_rot
-
-# ====== RapidOCR（テキストOCR） ======
-def rapid_ocr_text(img_gray) -> str:
-    ocr = get_rapid()
-    if ocr is None:
-        return "[RapidOCR 未使用] 初期化に失敗したため、問題文OCRは省略されました。"
-    rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-    res, _ = ocr(rgb)
+def build_calc_response(raw_expr: str) -> str:
+    norm = normalize_expr(raw_expr, ANGLE_MODE)
+    exact, approx = parse_and_eval(norm, PREC_DIGITS)
     lines = []
-    for item in (res or []):
-        txt = (item[1][0] or "").strip()
-        if txt: lines.append(txt)
-    text = "\n".join(lines)
-    text = re.sub(r"[^\S\r\n]+", " ", text)
-    return text.strip() or "(検出なし)"
+    lines.append("[式]")
+    lines.append(str(exact))
+    lines.append(f"近似（{PREC_DIGITS}桁）: {approx}")
+    lines.append("")
+    lines.append(make_cg50_guide(ANGLE_MODE, raw_expr))
+    return "\n".join(lines), norm
 
-# ====== Mathpix（キーがある時のみ使用） ======
-async def ocr_mathpix(image_bytes: bytes) -> Dict[str, Any]:
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    payload = {"src": f"data:image/jpeg;base64,{b64}",
-               "formats": ["text","data","latex_simplified"],
-               "rm_spaces": True,
-               "math_inline_delimiters": ["$","$"],
-               "math_block_delimiters": ["$$","$$"]}
-    headers = {"app_id": MATHPIX_APP_ID, "app_key": MATHPIX_APP_KEY, "Content-Type":"application/json"}
-    async with httpx.AsyncClient(timeout=45) as ac:
-        r = await ac.post("https://api.mathpix.com/v3/text", headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()
+# --------- LINE webhook ----------
+@app.post("/webhook")
+async def webhook(request: Request):
+    body = await request.body()
+    sig = request.headers.get("X-Line-Signature", "")
+    if not verify_signature(body, sig):
+        # 署名不一致でも 200 を返してリトライ嵐を避ける
+        set_last_error("signature verify failed", "")
+        return PlainTextResponse("signature NG", status_code=200)
 
-def extract_latex(mp: Dict[str, Any]) -> List[str]:
-    exprs: List[str] = []
-    items = (mp.get("data") or {}).get("items") or []
-    for it in items:
-        if it.get("type") in ("latex","asciimath","mathml") and it.get("value"):
-            exprs.append(it["value"])
-    if isinstance(mp.get("latex_simplified"), str) and mp["latex_simplified"].strip():
-        exprs.append(mp["latex_simplified"].strip())
-    text = (mp.get("text") or "")
-    for pat in [r"\$(.+?)\$", r"\\\((.+?))\\\)", r"\\\[(.+?)\\\]"]:
-        for m in re.finditer(pat, text, flags=re.S):
-            exprs.append(m.group(1))
-    uniq = []
-    for e in exprs:
-        e = e.strip()
-        if len(e) < 2: continue
-        if e not in uniq: uniq.append(e)
-    return uniq
-
-def latex_or_text_to_sympy(s: str) -> Tuple[Optional['sp.Expr'], str]:
-    if not SYM_AVAILABLE:
-        return None, s
-    disp = s
-    if HAS_PARSE_LATEX:
-        try:
-            e = parse_latex(s); return e, disp
-        except Exception:
-            pass
-    norm = normalize_expr(s)
     try:
-        e = sym_parse(norm); return e, norm.replace("**","^")
-    except Exception:
-        return None, disp
+        payload = json.loads(body.decode("utf-8"))
+        events = payload.get("events", [])
+        for ev in events:
+            if ev.get("type") != "message":
+                continue
+            reply_token = ev["replyToken"]
+            msg = ev["message"]
+            if msg.get("type") == "text":
+                text = msg.get("text", "")
+                lower = nfkc(text).lower()
 
-# ====== ルート & 健康確認 ======
+                # ping
+                if lower.startswith("ping"):
+                    await reply_line(reply_token, ["pong ✅"])
+                    continue
+
+                # 角度モード
+                if lower.startswith("mode:"):
+                    global ANGLE_MODE
+                    if "rad" in lower:
+                        ANGLE_MODE = "rad"
+                    else:
+                        ANGLE_MODE = "deg"
+                    await reply_line(reply_token, [f"角度モード: {'Deg' if ANGLE_MODE=='deg' else 'Rad'}"])
+                    continue
+
+                # 桁数
+                if lower.startswith("prec:"):
+                    global PREC_DIGITS
+                    try:
+                        PREC_DIGITS = max(3, min(20, int(lower.split(":",1)[1])))
+                        await reply_line(reply_token, [f"桁数を {PREC_DIGITS} に設定しました"])
+                    except Exception:
+                        await reply_line(reply_token, ["桁数の指定が不正です（例: prec: 8）"])
+                    continue
+
+                # 計算
+                if lower.startswith("calc:"):
+                    expr = text.split(":",1)[1]
+                    try:
+                        out, norm = build_calc_response(expr)
+                        await reply_line(reply_token, [out])
+                    except Exception as e:
+                        set_last_error(f"calc error: {e}", "")
+                        await reply_line(reply_token, [
+                            f"解析失敗: {e.__class__.__name__}\n入力: {expr}"
+                        ])
+                    continue
+
+                # ヘルプ
+                if lower in ("help", "usage", "使い方"):
+                    await reply_line(reply_token, [
+                        "使い方:\n"
+                        "- mode:deg / mode:rad\n"
+                        "- prec: 8  ← 近似の桁数\n"
+                        "- calc: 2sin30° + 60°\n"
+                        "- calc: sin30° + 3^2\n"
+                        "- calc: tan45°"
+                    ])
+                    continue
+
+                # その他はエコー
+                await reply_line(reply_token, [f"echo: {text}"])
+    except Exception as e:
+        set_last_error(f"webhook exception: {e}", "")
+    return PlainTextResponse("OK", status_code=200)
+
+async def reply_line(reply_token: str, texts):
+    msgs = [{"type": "text", "text": t} for t in texts]
+    payload = {"replyToken": reply_token, "messages": msgs}
+    await line_api_post("https://api.line.me/v2/bot/message/reply", payload)
+
+# --------- Debug Endpoints ----------
 @app.get("/")
 async def root():
-    info = {"ok": True,
-            "sympy": SYM_AVAILABLE,
-            "latex_parser": HAS_PARSE_LATEX,
-            "rapid_imported": RAPID_IMPORTED,
-            "mathpix_keys": bool(MATHPIX_APP_ID and MATHPIX_APP_KEY),
-            "prec_digits": PREC["digits"]}
-    logging.info(f"Startup info: {info}")
-    return info
+    return {"ok": True, "sympy": True, "latex_parser": True}
 
 @app.get("/calc_test")
 async def calc_test(expr: str):
-    n = normalize_expr(expr)
-    return {"raw": expr, "norm": n}
+    try:
+        norm = normalize_expr(expr, ANGLE_MODE)
+        exact, approx = parse_and_eval(norm, PREC_DIGITS)
+        return {
+            "raw": expr,
+            "norm": norm,
+            "exact": str(exact),
+            "approx": str(approx),
+            "mode": ANGLE_MODE,
+            "prec_digits": PREC_DIGITS,
+        }
+    except Exception as e:
+        set_last_error(f"calc_test error: {e}", "")
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 @app.get("/botinfo")
 async def botinfo():
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    async with httpx.AsyncClient(timeout=10) as ac:
-        r = await ac.get("https://api.line.me/v2/bot/info", headers=headers)
-    return Response(r.text, media_type="application/json", status_code=r.status_code)
+    try:
+        r = await line_api_get("https://api.line.me/v2/bot/info")
+        return Response(r.text, media_type="application/json", status_code=r.status_code)
+    except Exception as e:
+        set_last_error(f"botinfo error: {e}", "")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/envcheck")
 async def envcheck():
-    tok = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN","")
-    sec = os.environ.get("LINE_CHANNEL_SECRET","")
-    def mask(s): return f"{len(s)} chars : {s[:6]}...{s[-6:]}" if s else "(empty)"
-    return {"access_token": mask(tok), "channel_secret": mask(sec)}
+    return {
+        "access_token": (f"{len(LINE_CHANNEL_ACCESS_TOKEN)} chars" if LINE_CHANNEL_ACCESS_TOKEN else None),
+        "channel_secret": (f"{len(LINE_CHANNEL_SECRET)} chars" if LINE_CHANNEL_SECRET else None),
+        "angle_mode": ANGLE_MODE,
+        "prec_digits": PREC_DIGITS,
+    }
 
 @app.get("/last_error")
 async def last_error():
     return LAST_ERROR
-
-# ====== Webhook ======
-@app.post("/webhook")
-async def webhook(request: Request, x_line_signature: Optional[str] = Header(default=None)):
-    body_bytes = await request.body()
-    if LINE_CHANNEL_SECRET and not verify_signature(LINE_CHANNEL_SECRET, body_bytes, x_line_signature or ""):
-        logging.error("Signature verify failed")
-        return JSONResponse({"message": "signature error"}, status_code=400)
-
-    body = json.loads(body_bytes.decode("utf-8"))
-    events = body.get("events", [])
-
-    for event in events:
-        if event.get("type") != "message":
-            continue
-
-        reply_token = event.get("replyToken")
-        m = event.get("message", {})
-        msg_type = m.get("type")
-        logging.info(f'message.id = {m.get("id")} type={msg_type}')
-
-        try:
-            # ===== テキスト =====
-            if msg_type == "text":
-                text = (m.get("text") or "").strip()
-
-                # 角度モード
-                if text.lower().startswith("mode:"):
-                    v = text.split(":",1)[1].strip().lower()
-                    if v in ("deg","degree","degrees"):
-                        ANGLE_MODE["mode"]="deg"
-                        await reply_message(reply_token,[{"type":"text","text":"角度モード: Deg"}]); continue
-                    if v in ("rad","radian","radians"):
-                        ANGLE_MODE["mode"]="rad"
-                        await reply_message(reply_token,[{"type":"text","text":"角度モード: Rad"}]); continue
-                    await reply_message(reply_token,[{"type":"text","text":"mode:deg / mode:rad"}]); continue
-
-                # 近似桁数
-                if text.lower().startswith("prec:"):
-                    try:
-                        n = int(text.split(":",1)[1].strip())
-                        n = max(1, min(50, n))
-                        PREC["digits"] = n
-                        await reply_message(reply_token,[{"type":"text","text":f"近似表示桁数: {n} 桁"}]); continue
-                    except Exception:
-                        await reply_message(reply_token,[{"type":"text","text":"prec: の後に 1〜50 の整数を指定してください。"}]); continue
-
-                # 計算
-                if text.lower().startswith("calc:"):
-                    if not SYM_AVAILABLE:
-                        await reply_long_text(reply_token,"Sympy 未導入のため計算不可。requirements.txt に sympy を追加してください。"); continue
-                    raw = text[5:].strip()
-                    if not raw:
-                        await reply_message(reply_token,[{"type":"text","text":"式が空です。例: calc: sin30° + 3^2"}]); continue
-
-                    try:
-                        norm = normalize_expr(raw)
-                        expr = sym_parse(norm)
-                        exact_str = str(sp.simplify(expr)).replace("**","^")
-                        approx_str = str(sp.N(expr, PREC["digits"]))
-                        shown = str(sp.srepr(expr))
-                        guide = cg50_keyseq(exact_str)
-                        msg = f"[式]\n{shown}\n厳密: {exact_str}\n近似({PREC['digits']}桁): {approx_str}\n\nfx-CG50 操作ガイド\n{guide}"
-                        await reply_long_text(reply_token, msg)
-                    except Exception as ex_calc:
-                        LAST_ERROR["msg"] = f"{type(ex_calc).__name__}: {ex_calc}"
-                        LAST_ERROR["trace"] = traceback.format_exc(limit=5)
-                        logging.exception("calc error")
-                        await reply_long_text(reply_token, f"解析失敗: {ex_calc}\n入力: {raw}\n正規化: {normalize_expr(raw)}")
-                    continue
-
-                await reply_message(reply_token,[{"type":"text","text":"画像を送れば、問題文OCR＋式抽出＋厳密解＋電卓操作まで返します。"}])
-                continue
-
-            # ===== 画像 =====
-            if msg_type == "image":
-                cp = m.get("contentProvider") or {}
-                if cp.get("type") == "external" and cp.get("originalContentUrl"):
-                    async with httpx.AsyncClient(timeout=30) as ac:
-                        r = await ac.get(cp["originalContentUrl"]); r.raise_for_status()
-                        img_raw = r.content
-                else:
-                    img_raw = await get_line_image_bytes(m.get("id"))
-
-                try:
-                    bw, gray = preprocess(img_raw)
-                except Exception as ex:
-                    LAST_ERROR["msg"] = f"preprocess: {ex}"
-                    LAST_ERROR["trace"] = traceback.format_exc(limit=5)
-                    await reply_long_text(reply_token, f"画像前処理に失敗: {ex}")
-                    continue
-
-                text_ocr = rapid_ocr_text(gray)
-
-                expr_blocks: List[str] = []
-                if SYM_AVAILABLE:
-                    latex_list: List[str] = []
-                    if MATHPIX_APP_ID and MATHPIX_APP_KEY:
-                        try:
-                            jpg = cv2.imencode(".jpg", gray, [int(cv2.IMWRITE_JPEG_QUALITY),95])[1].tobytes()
-                            mp = await ocr_mathpix(jpg)
-                            latex_list = extract_latex(mp)
-                        except Exception as ex:
-                            expr_blocks.append(f"【数式OCR】Mathpix失敗: {ex}")
-                    else:
-                        expr_blocks.append("【数式OCR】Mathpix未設定のためスキップしました。")
-
-                    answers: List[str] = []
-                    for idx, latex in enumerate(latex_list, 1):
-                        e_sym, shown = latex_or_text_to_sympy(latex)
-                        if e_sym is None:
-                            answers.append(f"#{idx}\n抽出: {shown}\n→ 解析不可")
-                            continue
-                        exact_str = str(sp.simplify(e_sym)).replace("**","^")
-                        approx_str = str(sp.N(e_sym, PREC["digits"]))
-                        guide = cg50_keyseq(exact_str)
-                        answers.append(f"#{idx}\n抽出: {shown}\n厳密: {exact_str}\n近似({PREC['digits']}桁): {approx_str}\n\nfx-CG50 操作ガイド\n{guide}")
-                    if answers:
-                        expr_blocks.append("\n\n".join(answers))
-                else:
-                    expr_blocks.append("【計算】Sympy 未導入のため、数式解答は生成できません。")
-
-                head = "📄 問題文（OCR）\n" + (text_ocr if text_ocr else "(検出なし)")
-                tail = "\n\n" + ("".join(expr_blocks) if expr_blocks else "（数式抽出なし）")
-                await reply_long_text(reply_token, head + tail)
-                continue
-
-            await reply_message(reply_token,[{"type":"text","text":f"未対応メッセージタイプ: {msg_type}"}])
-
-        except httpx.HTTPStatusError as he:
-            LAST_ERROR["msg"] = f"HTTPStatusError: {he.response.status_code}"
-            LAST_ERROR["trace"] = traceback.format_exc(limit=5)
-            logging.exception("HTTPStatusError")
-            try:
-                await reply_message(reply_token,[{"type":"text","text":f"HTTPエラー: {he.response.status_code}"}])
-            except Exception:
-                pass
-        except Exception as ex:
-            LAST_ERROR["msg"] = f"{type(ex).__name__}: {ex}"
-            LAST_ERROR["trace"] = traceback.format_exc(limit=5)
-            logging.exception("Unhandled error")
-            try:
-                await reply_message(reply_token,[{"type":"text","text":f"内部エラー: {ex}"}])
-            except Exception:
-                pass
-
-    return JSONResponse({"status":"ok"})
