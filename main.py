@@ -337,6 +337,16 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             # ===== テキスト =====
             if msg_type == "text":
                 text = (m.get("text") or "").strip()
+                # 近似桁数の変更: 例) prec: 8
+if text.lower().startswith("prec:"):
+    try:
+        n = int(text.split(":",1)[1].strip())
+        n = max(1, min(50, n))   # 1〜50に制限
+        PREC["digits"] = n
+        await reply_message(reply_token, [{"type":"text","text":f"近似表示桁数: {n} 桁"}])
+    except Exception:
+        await reply_message(reply_token, [{"type":"text","text":"prec: の後に 1〜50 の整数を指定してください。"}])
+    continue
 
                 # 角度モード
                 if text.lower().startswith("mode:"):
@@ -435,5 +445,6 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
 
 
