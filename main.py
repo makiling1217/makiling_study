@@ -1,4 +1,4 @@
-# main.py — FastAPI only (deg/rad, 精密/近似, 電卓キー手順(詳細/MENU/EXIT付き), 【答え】)
+# main.py — FastAPI only / LINE bot / 計算＆電卓キー案内（必要時のみ）/ 正式名称で表記
 import os, hmac, hashlib, base64, json, re, unicodedata, logging
 from typing import Dict, Any, Tuple, List
 from fastapi import FastAPI, Request, Response
@@ -26,11 +26,13 @@ logger = logging.getLogger("uvicorn.error")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
-ANGLE_MODE = "deg"      # "deg" / "rad"
+# 状態
+ANGLE_MODE = "deg"        # "deg" or "rad"
 PREC_DIGITS = 6
+GUIDE_MODE = "smart"      # "on" | "off" | "smart"
 LAST_ERROR: Dict[str, Any] = {"msg": None, "trace": None}
 
-# ----------------- LINE utils -----------------
+# =============== Utility for LINE ===============
 def set_last_error(msg: str, trace: str = ""):
     LAST_ERROR["msg"] = msg
     LAST_ERROR["trace"] = trace
@@ -60,26 +62,26 @@ def verify_signature(body: bytes, signature: str) -> bool:
     expected = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
-# ----------------- calc core -----------------
+# =============== Calc Core ===============
 def nfkc(s: str) -> str:
     return unicodedata.normalize("NFKC", s)
 
 def normalize_expr(raw: str, angle_mode: str = "deg") -> str:
     """
-    修正点:
-      - 'sin30°' / 'sin(30°)' は rad(30)
-      - degモードでは 'sin30' も rad(30)
-      - **単独の '60°' は度記号を外すだけ(=60)**
+    仕様：
+      - sin30° / sin(30°) → sin(rad(30))
+      - degモードでは sin30 → sin(rad(30)) に統一
+      - 単独の 60° の “°” は外す（= 60）
     """
     s = nfkc(raw)
     s = re.sub(r"\s+", "", s)
 
-    s = (s.replace("×","*").replace("·","*").replace("∙","*")
-           .replace("÷","/")
-           .replace("−","-").replace("—","-").replace("―","-")
-           .replace("，",",").replace("；",";"))
+    s = (s.replace("×", "*").replace("·", "*").replace("∙", "*")
+           .replace("÷", "/")
+           .replace("−", "-").replace("—", "-").replace("―", "-")
+           .replace("，", ",").replace("；", ";"))
     s = s.replace("^", "**")
-    s = s.replace("π","pi").replace("Π","pi").replace("ｅ","e").replace("Ｅ","E")
+    s = s.replace("π", "pi").replace("Π", "pi").replace("ｅ", "e").replace("Ｅ", "E")
 
     # √x → sqrt(x)
     s = re.sub(r"√(?=[A-Za-z0-9\(])", "sqrt(", s)
@@ -90,7 +92,7 @@ def normalize_expr(raw: str, angle_mode: str = "deg") -> str:
     s = re.sub(r"(?<=\d)(?=pi\b)", "*", s)
     s = re.sub(r"(?<=\d)(?=e\b)", "*", s)
 
-    # 三角関数の角度(°)だけ rad() にする
+    # trig(数値°)
     s = re.sub(
         r"(?<![A-Za-z0-9_])(sin|cos|tan)\(\s*(\d+(?:\.\d+)?)\s*°\s*\)",
         lambda m: f"{m.group(1)}(rad({m.group(2)}))", s)
@@ -98,85 +100,113 @@ def normalize_expr(raw: str, angle_mode: str = "deg") -> str:
         r"(?<![A-Za-z0-9_])(sin|cos|tan)\s*(\d+(?:\.\d+)?)\s*°",
         lambda m: f"{m.group(1)}(rad({m.group(2)}))", s)
 
+    # degモード：trig(数値) → trig(rad(数値))
     if angle_mode == "deg":
         s = re.sub(
             r"(?<![A-Za-z0-9_])(sin|cos|tan)(?:\(\s*(\d+(?:\.\d+)?)\s*\)|\s*(\d+(?:\.\d+)?))",
             lambda m: f"{m.group(1)}(rad({m.group(2) or m.group(3)}))", s)
 
-    # 単独の n° は度記号を外すだけ
+    # 単独の “n°” は ° を取り除く
     s = re.sub(r"(\d+(?:\.\d+)?)°", r"\1", s)
 
     return s
 
 def parse_and_eval(norm: str, prec_digits: int):
     def rad(x): return x * pi / 180
-    local = {"sin": sin, "cos": cos, "tan": tan, "sqrt": sqrt, "pi": pi, "e": E, "E": E, "rad": rad}
+    local = {
+        "sin": sin, "cos": cos, "tan": tan,
+        "sqrt": sqrt, "pi": pi, "e": E, "E": E,
+        "rad": rad
+    }
     expr = parse_expr(norm, local_dict=local, transformations=TRANSFORMS, evaluate=False)
     exact = simplify(expr)
     approx = exact.evalf(prec_digits)
     return exact, approx
 
-# ---- 電卓キー案内（詳細/MENU/EXIT入り） ----
+# =============== Key Guide ===============
 KEY_MAP = {"+":"[+]", "-":"[-]", "*":"[×]", "/":"[÷]", "^":"[^]", "(": "[ ( ]", ")":"[ ) ]"}
 FUNC_KEY = {"sin":"[SIN]", "cos":"[COS]", "tan":"[TAN]"}
 
 def tokenize_for_keys(raw: str) -> List[str]:
-    s = nfkc(raw).replace("×","*").replace("÷","/").replace("−","-").replace(" ","").replace("°","")
-    s = s.replace("π","pi")
+    s = nfkc(raw).replace("×", "*").replace("÷", "/").replace("−", "-").replace(" ", "").replace("°", "")
+    s = s.replace("π", "pi")
     s = re.sub(r"√(?=[A-Za-z0-9\(])", "sqrt(", s)
     token_re = re.compile(r"(sin|cos|tan|sqrt|pi|\d+|\^|\+|\-|\*|/|\(|\))", re.I)
     return token_re.findall(s)
 
-def detailed_key_steps(raw: str, angle_mode: str) -> str:
+def needs_angle_steps(raw: str) -> bool:
+    t = nfkc(raw)
+    return bool(re.search(r"(sin|cos|tan|°)", t, flags=re.I))
+
+def key_steps(raw: str, angle_mode: str, include_angle_steps: bool) -> str:
     tokens = tokenize_for_keys(raw)
     steps: List[str] = []
     n = 1
-    def push(x): 
+    def push(x):
         nonlocal n; steps.append(f"{n}. {x}"); n += 1
 
-    # どの画面からでも迷わないための定型
-    push("（他アプリにいたら）[MENU] → RUN-MAT を選択（通常は '1'）")
-    push(f"角度モードを確認/変更: [SHIFT] → [SETUP] → Angle: {'Deg' if angle_mode=='deg' else 'Rad'} → [EXE] → [EXIT]")
+    if include_angle_steps:
+        push("（必要時）角度モードを設定： [SHIFT] → [MENUキー]（SETUP） → Angle を選択 → Deg/Rad を選ぶ → [EXEキー] → [EXITキー]")
+        steps.append("   - Deg（度数法）: Angle: Deg")
+        steps.append("   - Rad（弧度法）: Angle: Rad")
+        steps.append("")
 
-    # 入力の案内
-    i=0
+    # 入力キー列
+    i = 0
     while i < len(tokens):
         t = tokens[i].lower()
         if t.isdigit():
-            digs=[tokens[i]]; j=i+1
-            while j<len(tokens) and tokens[j].isdigit(): digs.append(tokens[j]); j+=1
-            push("".join(f"[{d}]" for d in digs)); i=j; continue
-        if t in FUNC_KEY: push(FUNC_KEY[t]+"（自動で '(' が入る）"); i+=1; continue
-        if t=="sqrt": push("[√]（自動で '(' が入る）"); i+=1; continue
-        if t=="pi": push("[π]"); i+=1; continue
-        if t in KEY_MAP: push(KEY_MAP[t]); i+=1; continue
-        push(f"[{tokens[i]}]"); i+=1
+            digs = [tokens[i]]
+            j = i + 1
+            while j < len(tokens) and tokens[j].isdigit():
+                digs.append(tokens[j]); j += 1
+            push("".join(f"[{d}]" for d in digs)); i = j; continue
+        if t in FUNC_KEY:
+            push(FUNC_KEY[t] + "（自動で '(' が入る）"); i += 1; continue
+        if t == "sqrt":
+            push("[√]（自動で '(' が入る）"); i += 1; continue
+        if t == "pi":
+            push("[π]"); i += 1; continue
+        if t in KEY_MAP:
+            push(KEY_MAP[t]); i += 1; continue
+        push(f"[{tokens[i]}]"); i += 1
 
-    push("[EXE]")
+    push("[EXEキー]")
     steps.append("")
-    steps.append("★迷ったら: [EXIT] を押す → 1つ前の画面に戻ります（SETUPや関数一覧、テンプレート表示からも戻れる）")
-    steps.append("★入力途中の取消: [AC]（行のクリア）／[EXIT]（直前のモードを閉じる）")
-    steps.append("★SIN/COS/TANはキーを押すと自動で '(' が入るので、引数後に [ ) ] を押してください。")
-    steps.append("★べき乗は [^]、平方根は [√]、円周率は [π]。")
+    steps.append("★困ったら： [EXITキー] で1画面戻る / [AC] で行をクリア")
+    steps.append("★SIN/COS/TAN は押すと '(' が入るので引数の後に [ ) ] を押す")
+    steps.append("★べき乗は [^]、平方根は [√]、円周率は [π]")
     return "\n".join(steps)
 
 def build_calc_response(raw_expr: str) -> Tuple[str, str]:
     norm = normalize_expr(raw_expr, ANGLE_MODE)
     exact, approx = parse_and_eval(norm, PREC_DIGITS)
-    body = []
-    body.append("[式]")
-    body.append(str(exact))
-    body.append(f"近似（{PREC_DIGITS}桁）: {approx}")
-    body.append("")
-    body.append("【答え】")
-    body.append(f"厳密: {exact}")
-    body.append(f"小数: {approx}")
-    body.append("")
-    body.append("fx-CG50 詳細キー手順")
-    body.append(detailed_key_steps(raw_expr, ANGLE_MODE))
-    return "\n".join(body), norm
 
-# ----------------- webhook -----------------
+    out_lines = []
+    out_lines.append("[式]")
+    out_lines.append(str(exact))
+    out_lines.append(f"近似（{PREC_DIGITS}桁）: {approx}")
+    out_lines.append("")
+    out_lines.append("【答え】")
+    out_lines.append(f"厳密: {exact}")
+    out_lines.append(f"小数: {approx}")
+
+    include_angle = False
+    if GUIDE_MODE == "on":
+        include_angle = needs_angle_steps(raw_expr)
+    elif GUIDE_MODE == "smart":
+        include_angle = needs_angle_steps(raw_expr)
+    else:  # "off"
+        include_angle = False
+
+    if GUIDE_MODE != "off":
+        out_lines.append("")
+        out_lines.append("fx-CG50 操作ガイド（この式向け）")
+        out_lines.append(key_steps(raw_expr, ANGLE_MODE, include_angle))
+
+    return "\n".join(out_lines), norm
+
+# =============== Webhook ===============
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.body()
@@ -211,6 +241,16 @@ async def webhook(request: Request):
                     await reply_line(reply_token, ["桁数の指定が不正です（例: prec: 8）"])
                 continue
 
+            if lower.startswith("guide:"):
+                global GUIDE_MODE
+                v = lower.split(":",1)[1].strip()
+                if v in ("on","off","smart"):
+                    GUIDE_MODE = v
+                    await reply_line(reply_token, [f"操作ガイド表示: {GUIDE_MODE}"])
+                else:
+                    await reply_line(reply_token, ["guide:on / guide:off / guide:smart のどれかを指定してください"])
+                continue
+
             if lower.startswith("calc:"):
                 expr = text.split(":",1)[1]
                 try:
@@ -224,11 +264,10 @@ async def webhook(request: Request):
             if lower in ("help","usage","使い方"):
                 await reply_line(reply_token, [
                     "使い方:\n"
-                    "- mode:deg / mode:rad\n"
-                    "- prec: 8  ← 近似の桁数\n"
-                    "- calc: 2sin30° + 60°\n"
-                    "- calc: sin30° + 3^2\n"
-                    "- calc: tan45°"
+                    "- mode:deg / mode:rad（角度）\n"
+                    "- prec: 8（近似の桁数）\n"
+                    "- guide:on|off|smart（操作ガイド表示）\n"
+                    "- calc: 2sin30° + 60° / calc: sin30° + 3^2 / calc: tan45°"
                 ])
                 continue
 
@@ -243,7 +282,7 @@ async def reply_line(reply_token: str, texts):
     payload = {"replyToken": reply_token, "messages": msgs}
     await line_api_post("https://api.line.me/v2/bot/message/reply", payload)
 
-# ----------------- debug endpoints -----------------
+# =============== Debug Endpoints ===============
 @app.get("/")
 async def root():
     return {"ok": True, "sympy": True, "latex_parser": True}
@@ -254,7 +293,7 @@ async def calc_test(expr: str):
         norm = normalize_expr(expr, ANGLE_MODE)
         exact, approx = parse_and_eval(norm, PREC_DIGITS)
         return {"raw": expr, "norm": norm, "exact": str(exact), "approx": str(approx),
-                "mode": ANGLE_MODE, "prec_digits": PREC_DIGITS}
+                "mode": ANGLE_MODE, "prec_digits": PREC_DIGITS, "guide_mode": GUIDE_MODE}
     except Exception as e:
         set_last_error(f"calc_test error: {e}", "")
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -275,6 +314,7 @@ async def envcheck():
         "channel_secret": (f"{len(LINE_CHANNEL_SECRET)} chars" if LINE_CHANNEL_SECRET else None),
         "angle_mode": ANGLE_MODE,
         "prec_digits": PREC_DIGITS,
+        "guide_mode": GUIDE_MODE,
     }
 
 @app.get("/last_error")
