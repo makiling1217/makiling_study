@@ -1,11 +1,10 @@
-# main.py — FastAPI only (deg/rad, 精密/近似, 電卓キー手順, 【答え】付き)
+# main.py — FastAPI only (deg/rad, 精密/近似, 電卓キー手順(詳細/MENU/EXIT付き), 【答え】)
 import os, hmac, hashlib, base64, json, re, unicodedata, logging
 from typing import Dict, Any, Tuple, List
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 
-# ==== sympy ====
 from sympy import sin, cos, tan, sqrt, pi, E, simplify
 from sympy.parsing.sympy_parser import (
     parse_expr,
@@ -67,22 +66,20 @@ def nfkc(s: str) -> str:
 
 def normalize_expr(raw: str, angle_mode: str = "deg") -> str:
     """
-    重要な修正：
-      - 'sin30°' や 'sin(30°)' は rad(30) に変換
-      - deg モードでは 'sin30' も rad(30) に変換
-      - **単独の '60°' は単なる '60' に変換（ラジアン化しない）**
+    修正点:
+      - 'sin30°' / 'sin(30°)' は rad(30)
+      - degモードでは 'sin30' も rad(30)
+      - **単独の '60°' は度記号を外すだけ(=60)**
     """
     s = nfkc(raw)
     s = re.sub(r"\s+", "", s)
 
-    s = (
-        s.replace("×", "*").replace("·", "*").replace("∙", "*")
-         .replace("÷", "/")
-         .replace("−", "-").replace("—", "-").replace("―", "-")
-         .replace("，", ",").replace("；", ";")
-    )
+    s = (s.replace("×","*").replace("·","*").replace("∙","*")
+           .replace("÷","/")
+           .replace("−","-").replace("—","-").replace("―","-")
+           .replace("，",",").replace("；",";"))
     s = s.replace("^", "**")
-    s = s.replace("π", "pi").replace("Π", "pi").replace("ｅ", "e").replace("Ｅ", "E")
+    s = s.replace("π","pi").replace("Π","pi").replace("ｅ","e").replace("Ｅ","E")
 
     # √x → sqrt(x)
     s = re.sub(r"√(?=[A-Za-z0-9\(])", "sqrt(", s)
@@ -93,41 +90,33 @@ def normalize_expr(raw: str, angle_mode: str = "deg") -> str:
     s = re.sub(r"(?<=\d)(?=pi\b)", "*", s)
     s = re.sub(r"(?<=\d)(?=e\b)", "*", s)
 
-    # 角度（°）— 三角関数の引数だけ rad() にする
-    # sin(30°)
+    # 三角関数の角度(°)だけ rad() にする
     s = re.sub(
         r"(?<![A-Za-z0-9_])(sin|cos|tan)\(\s*(\d+(?:\.\d+)?)\s*°\s*\)",
-        lambda m: f"{m.group(1)}(rad({m.group(2)}))",
-        s,
-    )
-    # sin30°
+        lambda m: f"{m.group(1)}(rad({m.group(2)}))", s)
     s = re.sub(
         r"(?<![A-Za-z0-9_])(sin|cos|tan)\s*(\d+(?:\.\d+)?)\s*°",
-        lambda m: f"{m.group(1)}(rad({m.group(2)}))",
-        s,
-    )
-    # deg モードでは sin30 → sin(rad(30))
+        lambda m: f"{m.group(1)}(rad({m.group(2)}))", s)
+
     if angle_mode == "deg":
         s = re.sub(
             r"(?<![A-Za-z0-9_])(sin|cos|tan)(?:\(\s*(\d+(?:\.\d+)?)\s*\)|\s*(\d+(?:\.\d+)?))",
-            lambda m: f"{m.group(1)}(rad({m.group(2) or m.group(3)}))",
-            s,
-        )
-    # ★単独の 60° などは「度記号を削除」だけ（ラジアン化しない）
+            lambda m: f"{m.group(1)}(rad({m.group(2) or m.group(3)}))", s)
+
+    # 単独の n° は度記号を外すだけ
     s = re.sub(r"(\d+(?:\.\d+)?)°", r"\1", s)
 
     return s
 
 def parse_and_eval(norm: str, prec_digits: int):
-    def rad(x):
-        return x * pi / 180
+    def rad(x): return x * pi / 180
     local = {"sin": sin, "cos": cos, "tan": tan, "sqrt": sqrt, "pi": pi, "e": E, "E": E, "rad": rad}
     expr = parse_expr(norm, local_dict=local, transformations=TRANSFORMS, evaluate=False)
     exact = simplify(expr)
     approx = exact.evalf(prec_digits)
     return exact, approx
 
-# ---- 電卓キー案内 ----
+# ---- 電卓キー案内（詳細/MENU/EXIT入り） ----
 KEY_MAP = {"+":"[+]", "-":"[-]", "*":"[×]", "/":"[÷]", "^":"[^]", "(": "[ ( ]", ")":"[ ) ]"}
 FUNC_KEY = {"sin":"[SIN]", "cos":"[COS]", "tan":"[TAN]"}
 
@@ -144,7 +133,12 @@ def detailed_key_steps(raw: str, angle_mode: str) -> str:
     n = 1
     def push(x): 
         nonlocal n; steps.append(f"{n}. {x}"); n += 1
-    push(f"角度モードを確認: {'Deg' if angle_mode=='deg' else 'Rad'}")
+
+    # どの画面からでも迷わないための定型
+    push("（他アプリにいたら）[MENU] → RUN-MAT を選択（通常は '1'）")
+    push(f"角度モードを確認/変更: [SHIFT] → [SETUP] → Angle: {'Deg' if angle_mode=='deg' else 'Rad'} → [EXE] → [EXIT]")
+
+    # 入力の案内
     i=0
     while i < len(tokens):
         t = tokens[i].lower()
@@ -152,15 +146,18 @@ def detailed_key_steps(raw: str, angle_mode: str) -> str:
             digs=[tokens[i]]; j=i+1
             while j<len(tokens) and tokens[j].isdigit(): digs.append(tokens[j]); j+=1
             push("".join(f"[{d}]" for d in digs)); i=j; continue
-        if t in FUNC_KEY: push(FUNC_KEY[t]+"（自動で '(' ）"); i+=1; continue
-        if t=="sqrt": push("[√]（自動で '(' ）"); i+=1; continue
+        if t in FUNC_KEY: push(FUNC_KEY[t]+"（自動で '(' が入る）"); i+=1; continue
+        if t=="sqrt": push("[√]（自動で '(' が入る）"); i+=1; continue
         if t=="pi": push("[π]"); i+=1; continue
         if t in KEY_MAP: push(KEY_MAP[t]); i+=1; continue
         push(f"[{tokens[i]}]"); i+=1
+
     push("[EXE]")
     steps.append("")
-    steps.append("※ 関数キーは押すと自動で '(' が入るので、引数の後に [ ) ] を押してください。")
-    steps.append("※ べき乗は [^]、平方根は [√]、円周率は [π]。")
+    steps.append("★迷ったら: [EXIT] を押す → 1つ前の画面に戻ります（SETUPや関数一覧、テンプレート表示からも戻れる）")
+    steps.append("★入力途中の取消: [AC]（行のクリア）／[EXIT]（直前のモードを閉じる）")
+    steps.append("★SIN/COS/TANはキーを押すと自動で '(' が入るので、引数後に [ ) ] を押してください。")
+    steps.append("★べき乗は [^]、平方根は [√]、円周率は [π]。")
     return "\n".join(steps)
 
 def build_calc_response(raw_expr: str) -> Tuple[str, str]:
