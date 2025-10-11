@@ -68,6 +68,7 @@ _ZK = "０１２３４５６７８９（）＊＋－／＾，．　ｉｊｘ"
 #            10桁  +2        +5記号        +2     +空白 +3
 _HK = "0123456789()*+-/^,. ijx"
 TRANS = str.maketrans(_ZK, _HK)
+assert len(_ZK) == len(_HK), f"maketrans length mismatch: {len(_ZK)} vs {len(_HK)}"
 
 def normalize_expr(s: str) -> str:
     s0 = s
@@ -359,5 +360,6 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
 
 
