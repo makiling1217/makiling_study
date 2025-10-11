@@ -1,4 +1,4 @@
-f# main.py — LINE Bot: Image→(Preprocess)→ OCR (Mathpix optional / RapidOCR lazy) → Sympy CAS → Answer
+# main.py — LINE Bot: OCR(optional) + Sympy CAS + 電卓手順
 import os, hmac, hashlib, base64, json, re, logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, Response
 import httpx
 
-# ====== CAS（厳密計算） ======
+# ====== 数式（Sympy） ======
 SYM_AVAILABLE = True
 try:
     import sympy as sp
@@ -27,7 +27,7 @@ except Exception:
 import numpy as np
 import cv2
 
-# ====== RapidOCR：遅延初期化 ======
+# ====== RapidOCR（遅延初期化） ======
 RAPID_IMPORTED = False
 rapid_ocr = None
 def get_rapid():
@@ -39,7 +39,7 @@ def get_rapid():
             from rapidocr_onnxruntime import RapidOCR
             rapid_ocr = RapidOCR()
             RAPID_IMPORTED = True
-            logging.info("RapidOCR initialized OK")
+            logging.info("RapidOCR initialized")
         except Exception as e:
             RAPID_IMPORTED = True
             rapid_ocr = None
@@ -57,7 +57,8 @@ MATHPIX_APP_KEY = os.environ.get("MATHPIX_APP_KEY", "")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{messageId}/content"
 
-ANGLE_MODE = {"mode": "deg"}  # deg / rad
+# 角度モード（asin/acos/atanの返りを度/ラジアン切替）
+ANGLE_MODE = {"mode": "deg"}  # "deg" or "rad"
 
 # ====== ユーティリティ ======
 def verify_signature(secret: str, body: bytes, signature: str) -> bool:
@@ -92,11 +93,12 @@ async def get_line_image_bytes(message_id: str) -> bytes:
         r.raise_for_status()
         return r.content
 
-# ====== 全角→半角 正規化 ======
+# ====== 全角→半角 ======
 _ZK = "０１２３４５６７８９（）＊＋－／＾，．　ｉｊｘ"
 _HK = "0123456789()*+-/^,. ijx"
 assert len(_ZK)==len(_HK), "maketrans length mismatch"
 TRANS = str.maketrans(_ZK, _HK)
+
 # --- 式の正規化（度→ラジアンに変換して安全に評価）---
 def normalize_expr(s: str) -> str:
     s = s.translate(TRANS)
@@ -113,6 +115,9 @@ def normalize_expr(s: str) -> str:
     # 単独の 30° → (30*pi/180)
     s = re.sub(r"(\d+(?:\.\d+)?)\s*°", r"(\1*pi/180)", s)
 
+    # “deg”, “degree(s)” を書いてくるケース → *pi/180
+    s = re.sub(r"\b(\d+(?:\.\d+)?)\s*(deg|degree|degrees)\b", r"(\1*pi/180)", s, flags=re.I)
+
     # 虚数 i/j → I
     s = re.sub(r"\b([0-9\.]+)[ij]\b", r"\1*I", s, flags=re.I)
     s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
@@ -121,35 +126,23 @@ def normalize_expr(s: str) -> str:
     s = re.sub(r"\s+","", s)
     return s
 
-def normalize_expr(s: str) -> str:
-    s = s.translate(TRANS)
-    s = s.replace("×","*").replace("÷","/").replace("−","-").replace("–","-")
-    s = s.replace("π","pi")
-    # √n → sqrt(n)
-    s = re.sub(r"√\s*([0-9a-zA-Z_\(])", r"sqrt(\1", s)
-    # 度記号（関数付き/単独）
-    s = re.sub(r"\b(sin|cos|tan)\s*([0-9]+(?:\.[0-9]+)?)\s*°", r"\1(deg(\2))", s, flags=re.I)
-    s = re.sub(r"(\d+(?:\.\d+)?)\s*°", r"deg(\1)", s)
-    # 関数の括弧省略（sin30 → sin(30)）
-    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*([0-9]+(?:\.[0-9]+)?)\b", r"\1(\2)", s, flags=re.I)
-    # 虚数
-    s = re.sub(r"\b([0-9\.]+)[ij]\b", r"\1*I", s, flags=re.I)
-    s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
-    # 演算子
-    s = s.replace("^","**")
-    s = re.sub(r"\s+","", s)
-    return s
-
 # ====== Sympy 準備 ======
 if SYM_AVAILABLE:
-    def _deg(x): return x * sp.pi / 180
     def _rad2deg(x): return x * 180 / sp.pi
     def nCr(n,r): return sp.binomial(n,r)
     def nPr(n,r): return sp.factorial(n)/sp.factorial(n-r)
-    def _wrap_trig(func):
-        def f(x):
-            return func(_deg(x)) if ANGLE_MODE["mode"]=="deg" else func(x)
-        return f
+
+    # asin/acos/atan は角度モードで度に戻す
+    def asin_mode(x): 
+        y = sp.asin(x)
+        return y if ANGLE_MODE["mode"]=="rad" else _rad2deg(y)
+    def acos_mode(x):
+        y = sp.acos(x)
+        return y if ANGLE_MODE["mode"]=="rad" else _rad2deg(y)
+    def atan_mode(x):
+        y = sp.atan(x)
+        return y if ANGLE_MODE["mode"]=="rad" else _rad2deg(y)
+
     SYM_LOCALS = {
         "pi": sp.pi, "e": sp.E, "I": sp.I,
         "abs": sp.Abs, "sqrt": sp.sqrt, "exp": sp.exp,
@@ -157,20 +150,20 @@ if SYM_AVAILABLE:
         "floor": sp.floor, "ceil": sp.ceiling,
         "nCr": nCr, "C": nCr, "comb": nCr,
         "nPr": nPr, "P": nPr, "perm": nPr,
-        "sin": _wrap_trig(sp.sin), "cos": _wrap_trig(sp.cos), "tan": _wrap_trig(sp.tan),
-        "asin": (lambda x: sp.asin(x) if ANGLE_MODE["mode"]=="rad" else _rad2deg(sp.asin(x))),
-        "acos": (lambda x: sp.acos(x) if ANGLE_MODE["mode"]=="rad" else _rad2deg(sp.acos(x))),
-        "atan": (lambda x: sp.atan(x) if ANGLE_MODE["mode"]=="rad" else _rad2deg(sp.atan(x))),
+        "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
+        "asin": asin_mode, "acos": acos_mode, "atan": atan_mode,
         "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
-        "deg": _deg,
         "Matrix": sp.Matrix,
     }
+
     TRANSFORMS = (standard_transformations
                   + (implicit_multiplication_application,)
                   + (convert_xor,)
                   + (function_exponentiation,))
+
     def sym_parse(expr: str):
         return parse_expr(expr, local_dict=SYM_LOCALS, transformations=TRANSFORMS, evaluate=True)
+
     def sym_eval_numeric(expr: str):
         e = sym_parse(expr); return sp.N(e)
 
@@ -184,7 +177,7 @@ def cg50_keyseq(expr_show: str) -> str:
            .replace("sqrt","[√]").replace("log10","[LOG]10,").replace("log","[LN]"))
     return "角度:" + ("Deg" if ANGLE_MODE["mode"]=="deg" else "Rad") + " → 入力: " + s + " → [EXE]"
 
-# ====== 前処理 ======
+# ====== 画像前処理 ======
 def preprocess(img_bytes: bytes):
     arr = np.frombuffer(img_bytes, dtype=np.uint8)
     im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -206,7 +199,7 @@ def preprocess(img_bytes: bytes):
     bw = cv2.adaptiveThreshold(enh, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 15)
     return bw, gray_rot
 
-# ====== RapidOCR（テキスト） ======
+# ====== RapidOCR（テキストOCR） ======
 def rapid_ocr_text(img_gray) -> str:
     ocr = get_rapid()
     if ocr is None:
@@ -221,7 +214,7 @@ def rapid_ocr_text(img_gray) -> str:
     text = re.sub(r"[^\S\r\n]+", " ", text)
     return text.strip() or "(検出なし)"
 
-# ====== Mathpix（キーがある時だけ呼ぶ） ======
+# ====== Mathpix（キーがある時のみ使用） ======
 async def ocr_mathpix(image_bytes: bytes) -> Dict[str, Any]:
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {"src": f"data:image/jpeg;base64,{b64}",
@@ -244,7 +237,7 @@ def extract_latex(mp: Dict[str, Any]) -> List[str]:
     if isinstance(mp.get("latex_simplified"), str) and mp["latex_simplified"].strip():
         exprs.append(mp["latex_simplified"].strip())
     text = (mp.get("text") or "")
-    for pat in [r"\$(.+?)\$", r"\\\((.+?)\\\)", r"\\\[(.+?)\\\]"]:
+    for pat in [r"\$(.+?)\$", r"\\\((.+?))\\\)", r"\\\[(.+?)\\\]"]:
         for m in re.finditer(pat, text, flags=re.S):
             exprs.append(m.group(1))
     uniq = []
@@ -290,7 +283,7 @@ def keyseq_for_expr(expr: 'sp.Expr') -> str:
     shown = str(sp.simplify(expr)).replace("**","^")
     return "fx-CG50 操作ガイド\n" + cg50_keyseq(shown)
 
-# ====== ルーティング ======
+# ====== ルート & 健康確認 ======
 @app.get("/")
 async def root():
     info = {"ok": True,
@@ -308,7 +301,6 @@ async def botinfo():
         r = await ac.get("https://api.line.me/v2/bot/info", headers=headers)
     return Response(r.text, media_type="application/json", status_code=r.status_code)
 
-# 環境変数目視用（必要なときだけ使う）
 @app.get("/envcheck")
 async def envcheck():
     tok = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN","")
@@ -316,6 +308,7 @@ async def envcheck():
     def mask(s): return f"{len(s)} chars : {s[:6]}...{s[-6:]}" if s else "(empty)"
     return {"access_token": mask(tok), "channel_secret": mask(sec)}
 
+# ====== Webhook ======
 @app.post("/webhook")
 async def webhook(request: Request, x_line_signature: Optional[str] = Header(default=None)):
     body_bytes = await request.body()
@@ -340,14 +333,18 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             if msg_type == "text":
                 text = (m.get("text") or "").strip()
 
+                # 角度モード
                 if text.lower().startswith("mode:"):
                     v = text.split(":",1)[1].strip().lower()
                     if v in ("deg","degree","degrees"):
-                        ANGLE_MODE["mode"]="deg"; await reply_message(reply_token,[{"type":"text","text":"角度モード: Deg"}]); continue
+                        ANGLE_MODE["mode"]="deg"
+                        await reply_message(reply_token,[{"type":"text","text":"角度モード: Deg"}]); continue
                     if v in ("rad","radian","radians"):
-                        ANGLE_MODE["mode"]="rad"; await reply_message(reply_token,[{"type":"text","text":"角度モード: Rad"}]); continue
+                        ANGLE_MODE["mode"]="rad"
+                        await reply_message(reply_token,[{"type":"text","text":"角度モード: Rad"}]); continue
                     await reply_message(reply_token,[{"type":"text","text":"mode:deg / mode:rad"}]); continue
 
+                # 計算
                 if text.lower().startswith("calc:"):
                     if not SYM_AVAILABLE:
                         await reply_long_text(reply_token,"Sympy 未導入のため計算不可。requirements.txt に sympy を追加してください。"); continue
@@ -367,10 +364,10 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
 
                 await reply_message(reply_token,[{"type":"text","text":"画像を送れば、問題文OCR＋式抽出＋厳密解＋電卓操作まで返します。"}])
                 continue
-raw = text[5:].strip()
+
             # ===== 画像 =====
             if msg_type == "image":
-                # 1) 画像取得
+                # 画像取得
                 cp = m.get("contentProvider") or {}
                 if cp.get("type") == "external" and cp.get("originalContentUrl"):
                     async with httpx.AsyncClient(timeout=30) as ac:
@@ -379,17 +376,17 @@ raw = text[5:].strip()
                 else:
                     img_raw = await get_line_image_bytes(m.get("id"))
 
-                # 2) 前処理
+                # 前処理
                 try:
                     bw, gray = preprocess(img_raw)
                 except Exception as ex:
                     await reply_long_text(reply_token, f"画像前処理に失敗: {ex}")
                     continue
 
-                # 3) 問題文OCR（RapidOCR）
+                # 問題文OCR（RapidOCR）
                 text_ocr = rapid_ocr_text(gray)
 
-                # 4) 数式OCR（Mathpixが設定されている場合のみ）
+                # 数式OCR（Mathpixがあるときのみ）
                 expr_blocks: List[str] = []
                 if SYM_AVAILABLE:
                     latex_list: List[str] = []
@@ -433,5 +430,3 @@ raw = text[5:].strip()
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
-
-
