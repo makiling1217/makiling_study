@@ -31,6 +31,15 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 MATHPIX_APP_ID = os.environ.get("MATHPIX_APP_ID", "")
 MATHPIX_APP_KEY = os.environ.get("MATHPIX_APP_KEY", "")
+latex_list = []
+if MATHPIX_APP_ID and MATHPIX_APP_KEY:
+    try:
+        mp = await ocr_mathpix(cv2.imencode(".jpg", gray, [int(cv2.IMWRITE_JPEG_QUALITY),95])[1].tobytes())
+        latex_list = extract_latex(mp)
+    except Exception as ex:
+        expr_blocks.append(f"【数式OCR】Mathpix失敗: {ex}")
+else:
+    expr_blocks.append("【数式OCR】Mathpix未設定のためスキップしました。")
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{messageId}/content"  # ←画像は api-data 固定
@@ -365,3 +374,4 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
