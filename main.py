@@ -63,6 +63,11 @@ def verify_signature(channel_secret: str, body: bytes, signature: str) -> bool:
 _ZK = "０１２３４５６７８９（）＊＋－／＾，．　ｉｊｘ"
 _HK = "0123456789()*/+/-^,. ijx"
 TRANS = str.maketrans(_ZK, _HK)
+# 全角→半角マップ（文字数は _ZK == _HK == 23 にすること）
+_ZK = "０１２３４５６７８９（）＊＋－／＾，．　ｉｊｘ"
+#            10桁  +2        +5記号        +2     +空白 +3
+_HK = "0123456789()*+-/^,. ijx"
+TRANS = str.maketrans(_ZK, _HK)
 
 def normalize_expr(s: str) -> str:
     s0 = s
@@ -354,4 +359,5 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
 
