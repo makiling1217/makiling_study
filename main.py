@@ -17,6 +17,7 @@ try:
     )
 except Exception:
     SYM_AVAILABLE = False
+logging.info(f"Sympy available: {SYM_AVAILABLE}")
 
 # ====== 基本設定 ======
 app = FastAPI()
@@ -353,3 +354,4 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
