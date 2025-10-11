@@ -97,6 +97,29 @@ _ZK = "０１２３４５６７８９（）＊＋－／＾，．　ｉｊｘ"
 _HK = "0123456789()*+-/^,. ijx"
 assert len(_ZK)==len(_HK), "maketrans length mismatch"
 TRANS = str.maketrans(_ZK, _HK)
+# --- 式の正規化（度→ラジアンに変換して安全に評価）---
+def normalize_expr(s: str) -> str:
+    s = s.translate(TRANS)
+    s = s.replace("×","*").replace("÷","/").replace("−","-").replace("–","-")
+    s = s.replace("π","pi")
+    # √n → sqrt(n)
+    s = re.sub(r"√\s*([0-9a-zA-Z_\(])", r"sqrt(\1", s)
+
+    # 度記号（関数付き/単独）
+    # sin30° / cos45° / tan60° → sin(30*pi/180) など
+    s = re.sub(r"\b(sin|cos|tan)\s*([0-9]+(?:\.[0-9]+)?)\s*°", r"\1(\2*pi/180)", s, flags=re.I)
+    # sin30 → sin(30) 等（括弧省略）
+    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*([0-9]+(?:\.[0-9]+)?)\b", r"\1(\2)", s, flags=re.I)
+    # 単独の 30° → (30*pi/180)
+    s = re.sub(r"(\d+(?:\.\d+)?)\s*°", r"(\1*pi/180)", s)
+
+    # 虚数 i/j → I
+    s = re.sub(r"\b([0-9\.]+)[ij]\b", r"\1*I", s, flags=re.I)
+    s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
+
+    s = s.replace("^","**")
+    s = re.sub(r"\s+","", s)
+    return s
 
 def normalize_expr(s: str) -> str:
     s = s.translate(TRANS)
@@ -410,3 +433,4 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
