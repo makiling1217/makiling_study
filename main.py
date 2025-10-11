@@ -105,11 +105,10 @@ TRANS = str.maketrans(_ZK, _HK)
 
 # --- 式の正規化（度→ラジアンを安定変換）---
 def normalize_expr(s: str) -> str:
-    # まず基本の正規化
+    # 基本正規化
     s = s.translate(TRANS)
     s = s.replace("×","*").replace("÷","/").replace("−","-").replace("–","-")
-    s = s.replace("π","pi")
-
+    s = s.replace("π","pi").replace("º","°")
     # √n → sqrt(n
     s = re.sub(r"√\s*([0-9a-zA-Z_\(])", r"sqrt(\1", s)
 
@@ -117,18 +116,21 @@ def normalize_expr(s: str) -> str:
     s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh|asin|acos|atan)\s*([0-9]+(?:\.[0-9]+)?)\b",
                r"\1(\2)", s, flags=re.I)
 
-    # 度表記を一本化： 30°/30º/30 deg/30degrees → rad(30)
-    # 先に全てのバリアント記号を通常の度記号に統一
-    s = s.replace("º", "°")
-    # 数字 + [空白] + (° or 単語)
+    # 1) f( … )°  → f(rad(…))
+    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*\(\s*([^\(\)]*?)\s*\)\s*°",
+               r"\1(rad(\2))", s, flags=re.I)
+
+    # 2) 数字の度表記 30° / 30 deg / 30degrees → rad(30)
     s = re.sub(r"(\d+(?:\.\d+)?)\s*(?:°|deg|degree|degrees)\b", r"rad(\1)", s, flags=re.I)
-    # 念のため、残った単独の度記号は削除（解析エラー回避）
-    s = s.replace("°", "")
 
     # 虚数 i/j → I
     s = re.sub(r"\b([0-9\.]+)[ij]\b", r"\1*I", s, flags=re.I)
     s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
 
+    # 余りの度記号は念のため除去（ここまでで全てrad化できている想定）
+    s = s.replace("°","")
+
+    # 演算子 / 空白
     s = s.replace("^","**")
     s = re.sub(r"\s+","", s)
     return s
@@ -161,7 +163,7 @@ if SYM_AVAILABLE:
         "asin": asin_mode, "acos": acos_mode, "atan": atan_mode,
         "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
         "Matrix": sp.Matrix,
-        # 度→ラジアン（normalize で rad(30) に統一）
+        # 度→ラジアン（normalize で rad(…) に統一）
         "rad": (lambda x: x*sp.pi/180),
     }
 
@@ -172,9 +174,6 @@ if SYM_AVAILABLE:
 
     def sym_parse(expr: str):
         return parse_expr(expr, local_dict=SYM_LOCALS, transformations=TRANSFORMS, evaluate=True)
-
-    def sym_eval_numeric(expr: str):
-        e = sym_parse(expr); return sp.N(e)
 
 # ====== 電卓キー列（fx-CG50 風） ======
 def cg50_keyseq(expr_show: str) -> str:
@@ -271,18 +270,6 @@ def latex_or_text_to_sympy(s: str) -> Tuple[Optional['sp.Expr'], str]:
     except Exception:
         return None, disp
 
-def kind_eval_or_solve(e: 'sp.Expr') -> Tuple[str, 'sp.Expr', Optional['sp.Expr']]:
-    try:
-        if isinstance(e, sp.Equality):
-            syms = sorted(list(e.free_symbols), key=lambda s: s.name)
-            if not syms:
-                return "eval", e, sp.simplify(e.lhs - e.rhs)
-            sol = sp.solve(e, *syms, dict=True)
-            return "solve", e, sp.ImmutableDenseNDimArray(sol)
-        return "eval", e, sp.N(e)
-    except Exception:
-        return "skip", e, None
-
 # ====== ルート & 健康確認 ======
 @app.get("/")
 async def root():
@@ -294,6 +281,12 @@ async def root():
             "prec_digits": PREC["digits"]}
     logging.info(f"Startup info: {info}")
     return info
+
+# デバッグ：正規化だけを確認
+@app.get("/calc_test")
+async def calc_test(expr: str):
+    n = normalize_expr(expr)
+    return {"raw": expr, "norm": n}
 
 @app.get("/botinfo")
 async def botinfo():
@@ -374,7 +367,7 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
                         msg = f"[式]\n{shown}\n厳密: {exact_str}\n近似({PREC['digits']}桁): {approx_str}\n\nfx-CG50 操作ガイド\n{guide}"
                         await reply_long_text(reply_token, msg)
                     except Exception as ex:
-                        await reply_long_text(reply_token, f"解析失敗: {ex}\n入力: {raw}")
+                        await reply_long_text(reply_token, f"解析失敗: {ex}\n入力: {raw}\n正規化: {norm}")
                     continue
 
                 await reply_message(reply_token,[{"type":"text","text":"画像を送れば、問題文OCR＋式抽出＋厳密解＋電卓操作まで返します。"}])
@@ -421,7 +414,6 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
                         if e_sym is None:
                             answers.append(f"#{idx}\n抽出: {shown}\n→ 解析不可")
                             continue
-                        # 厳密と近似
                         exact_str = str(sp.simplify(e_sym)).replace("**","^")
                         approx_str = str(sp.N(e_sym, PREC["digits"]))
                         guide = cg50_keyseq(exact_str)
