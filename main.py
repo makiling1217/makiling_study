@@ -1,11 +1,11 @@
-# main.py — FastAPI only (with detailed key guide + 【答え】section)
+# main.py — FastAPI only (deg/rad, 精密/近似, 電卓キー手順, 【答え】付き)
 import os, hmac, hashlib, base64, json, re, unicodedata, logging
 from typing import Dict, Any, Tuple, List
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 
-# ==== Calculator (sympy) ====
+# ==== sympy ====
 from sympy import sin, cos, tan, sqrt, pi, E, simplify
 from sympy.parsing.sympy_parser import (
     parse_expr,
@@ -16,23 +16,22 @@ from sympy.parsing.sympy_parser import (
 )
 
 TRANSFORMS = standard_transformations + (
-    implicit_multiplication_application,  # 2x, 2(x), (a)b
-    function_exponentiation,              # sin^2 x
-    convert_xor,                          # ^ → **
+    implicit_multiplication_application,
+    function_exponentiation,
+    convert_xor,
 )
 
-# ========= App =========
 app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
-ANGLE_MODE = "deg"          # "deg" / "rad"
-PREC_DIGITS = 6             # 近似の桁
+ANGLE_MODE = "deg"      # "deg" / "rad"
+PREC_DIGITS = 6
 LAST_ERROR: Dict[str, Any] = {"msg": None, "trace": None}
 
-# --------- Utilities ----------
+# ----------------- LINE utils -----------------
 def set_last_error(msg: str, trace: str = ""):
     LAST_ERROR["msg"] = msg
     LAST_ERROR["trace"] = trace
@@ -62,11 +61,17 @@ def verify_signature(body: bytes, signature: str) -> bool:
     expected = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
-# ---- Normalization ----
+# ----------------- calc core -----------------
 def nfkc(s: str) -> str:
     return unicodedata.normalize("NFKC", s)
 
 def normalize_expr(raw: str, angle_mode: str = "deg") -> str:
+    """
+    重要な修正：
+      - 'sin30°' や 'sin(30°)' は rad(30) に変換
+      - deg モードでは 'sin30' も rad(30) に変換
+      - **単独の '60°' は単なる '60' に変換（ラジアン化しない）**
+    """
     s = nfkc(raw)
     s = re.sub(r"\s+", "", s)
 
@@ -83,29 +88,34 @@ def normalize_expr(raw: str, angle_mode: str = "deg") -> str:
     s = re.sub(r"√(?=[A-Za-z0-9\(])", "sqrt(", s)
 
     # 暗黙の掛け算
-    s = re.sub(r"(?<=\d)(?=[A-Za-z\(])", "*", s)
-    s = re.sub(r"(?<=\))(?=[A-Za-z0-9\(])", ")*", s)
+    s = re.sub(r"(?<=\d)(?=[A-Za-z\(])", "*", s)      # 2x, 2(x)
+    s = re.sub(r"(?<=\))(?=[A-Za-z0-9\(])", ")*", s)  # )( → )*
     s = re.sub(r"(?<=\d)(?=pi\b)", "*", s)
     s = re.sub(r"(?<=\d)(?=e\b)", "*", s)
 
-    # 角度（°）
+    # 角度（°）— 三角関数の引数だけ rad() にする
+    # sin(30°)
     s = re.sub(
         r"(?<![A-Za-z0-9_])(sin|cos|tan)\(\s*(\d+(?:\.\d+)?)\s*°\s*\)",
         lambda m: f"{m.group(1)}(rad({m.group(2)}))",
         s,
     )
+    # sin30°
     s = re.sub(
         r"(?<![A-Za-z0-9_])(sin|cos|tan)\s*(\d+(?:\.\d+)?)\s*°",
         lambda m: f"{m.group(1)}(rad({m.group(2)}))",
         s,
     )
+    # deg モードでは sin30 → sin(rad(30))
     if angle_mode == "deg":
         s = re.sub(
             r"(?<![A-Za-z0-9_])(sin|cos|tan)(?:\(\s*(\d+(?:\.\d+)?)\s*\)|\s*(\d+(?:\.\d+)?))",
             lambda m: f"{m.group(1)}(rad({m.group(2) or m.group(3)}))",
             s,
         )
-    s = re.sub(r"(\d+(?:\.\d+)?)°", r"rad(\1)", s)
+    # ★単独の 60° などは「度記号を削除」だけ（ラジアン化しない）
+    s = re.sub(r"(\d+(?:\.\d+)?)°", r"\1", s)
+
     return s
 
 def parse_and_eval(norm: str, prec_digits: int):
@@ -117,84 +127,45 @@ def parse_and_eval(norm: str, prec_digits: int):
     approx = exact.evalf(prec_digits)
     return exact, approx
 
-# ---- Detailed key guide ----
+# ---- 電卓キー案内 ----
 KEY_MAP = {"+":"[+]", "-":"[-]", "*":"[×]", "/":"[÷]", "^":"[^]", "(": "[ ( ]", ")":"[ ) ]"}
 FUNC_KEY = {"sin":"[SIN]", "cos":"[COS]", "tan":"[TAN]"}
 
 def tokenize_for_keys(raw: str) -> List[str]:
-    s = nfkc(raw)
-    s = s.replace("×","*").replace("÷","/").replace("−","-")
-    s = s.replace(" ", "")
-    # 度記号はDegでは不要（数値だけでOK）
-    s = s.replace("°","")
-    # ^ はそのまま、π は pi と π の両方許容
+    s = nfkc(raw).replace("×","*").replace("÷","/").replace("−","-").replace(" ","").replace("°","")
     s = s.replace("π","pi")
-    # √ → sqrt(
     s = re.sub(r"√(?=[A-Za-z0-9\(])", "sqrt(", s)
-
-    # トークン化
     token_re = re.compile(r"(sin|cos|tan|sqrt|pi|\d+|\^|\+|\-|\*|/|\(|\))", re.I)
-    tokens = token_re.findall(s)
-    return tokens
+    return token_re.findall(s)
 
 def detailed_key_steps(raw: str, angle_mode: str) -> str:
     tokens = tokenize_for_keys(raw)
     steps: List[str] = []
-    step_no = 1
-
-    def push(txt: str):
-        nonlocal step_no
-        steps.append(f"{step_no}. {txt}")
-        step_no += 1
-
+    n = 1
+    def push(x): 
+        nonlocal n; steps.append(f"{n}. {x}"); n += 1
     push(f"角度モードを確認: {'Deg' if angle_mode=='deg' else 'Rad'}")
-
-    i = 0
+    i=0
     while i < len(tokens):
         t = tokens[i].lower()
         if t.isdigit():
-            digits = [tokens[i]]
-            j = i+1
-            while j < len(tokens) and tokens[j].isdigit():
-                digits.append(tokens[j]); j += 1
-            push("".join(f"[{d}]" for d in digits))
-            i = j
-            continue
-
-        if t in ("sin","cos","tan"):
-            push(FUNC_KEY[t] + "（自動で '(' が入る）")
-            i += 1
-            continue
-
-        if t == "sqrt":
-            push("[√]（自動で '(' が入る）")
-            i += 1
-            continue
-
-        if t == "pi":
-            push("[π]")
-            i += 1
-            continue
-
-        if t in KEY_MAP:
-            push(KEY_MAP[t])
-            i += 1
-            continue
-
-        push(f"[{tokens[i]}]")
-        i += 1
-
+            digs=[tokens[i]]; j=i+1
+            while j<len(tokens) and tokens[j].isdigit(): digs.append(tokens[j]); j+=1
+            push("".join(f"[{d}]" for d in digs)); i=j; continue
+        if t in FUNC_KEY: push(FUNC_KEY[t]+"（自動で '(' ）"); i+=1; continue
+        if t=="sqrt": push("[√]（自動で '(' ）"); i+=1; continue
+        if t=="pi": push("[π]"); i+=1; continue
+        if t in KEY_MAP: push(KEY_MAP[t]); i+=1; continue
+        push(f"[{tokens[i]}]"); i+=1
     push("[EXE]")
     steps.append("")
     steps.append("※ 関数キーは押すと自動で '(' が入るので、引数の後に [ ) ] を押してください。")
-    steps.append("※ べき乗は [^]、平方根は [√]、円周率は [π]。機種により [π] は [SHIFT]+[EXP] など。")
+    steps.append("※ べき乗は [^]、平方根は [√]、円周率は [π]。")
     return "\n".join(steps)
 
 def build_calc_response(raw_expr: str) -> Tuple[str, str]:
     norm = normalize_expr(raw_expr, ANGLE_MODE)
     exact, approx = parse_and_eval(norm, PREC_DIGITS)
-
-    # 【答え】セクションを追加
     body = []
     body.append("[式]")
     body.append(str(exact))
@@ -202,13 +173,13 @@ def build_calc_response(raw_expr: str) -> Tuple[str, str]:
     body.append("")
     body.append("【答え】")
     body.append(f"厳密: {exact}")
-    body.append(f"小数: {approx}")  # 小数は prec 指定桁
+    body.append(f"小数: {approx}")
     body.append("")
     body.append("fx-CG50 詳細キー手順")
     body.append(detailed_key_steps(raw_expr, ANGLE_MODE))
     return "\n".join(body), norm
 
-# --------- LINE webhook ----------
+# ----------------- webhook -----------------
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.body()
@@ -219,16 +190,11 @@ async def webhook(request: Request):
 
     try:
         payload = json.loads(body.decode("utf-8"))
-        events = payload.get("events", [])
-        for ev in events:
-            if ev.get("type") != "message":
-                continue
+        for ev in payload.get("events", []):
+            if ev.get("type") != "message": continue
+            if ev["message"].get("type") != "text": continue
             reply_token = ev["replyToken"]
-            msg = ev["message"]
-            if msg.get("type") != "text":
-                continue
-
-            text = msg.get("text","")
+            text = ev["message"]["text"]
             lower = nfkc(text).lower()
 
             if lower.startswith("ping"):
@@ -251,7 +217,7 @@ async def webhook(request: Request):
             if lower.startswith("calc:"):
                 expr = text.split(":",1)[1]
                 try:
-                    out, _norm = build_calc_response(expr)
+                    out, _ = build_calc_response(expr)
                     await reply_line(reply_token, [out])
                 except Exception as e:
                     set_last_error(f"calc error: {e}", "")
@@ -280,7 +246,7 @@ async def reply_line(reply_token: str, texts):
     payload = {"replyToken": reply_token, "messages": msgs}
     await line_api_post("https://api.line.me/v2/bot/message/reply", payload)
 
-# --------- Debug Endpoints ----------
+# ----------------- debug endpoints -----------------
 @app.get("/")
 async def root():
     return {"ok": True, "sympy": True, "latex_parser": True}
