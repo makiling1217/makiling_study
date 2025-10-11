@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, Response
 import httpx
+# 近似表示の桁数（環境変数 PREC_DIGITS があればそれを使う）
+PREC = {"digits": int(os.environ.get("PREC_DIGITS", "6"))}
 
 # ====== 数式（Sympy） ======
 SYM_AVAILABLE = True
@@ -433,4 +435,5 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
 
