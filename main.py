@@ -101,30 +101,31 @@ TRANS = str.maketrans(_ZK, _HK)
 
 # --- 式の正規化（度→ラジアンに変換して安全に評価）---
 def normalize_expr(s: str) -> str:
+    # 全角→半角・基本置換
     s = s.translate(TRANS)
     s = s.replace("×","*").replace("÷","/").replace("−","-").replace("–","-")
     s = s.replace("π","pi")
+
     # √n → sqrt(n)
     s = re.sub(r"√\s*([0-9a-zA-Z_\(])", r"sqrt(\1", s)
 
-    # 度記号（関数付き/単独）
-    # sin30° / cos45° / tan60° → sin(30*pi/180) など
-    s = re.sub(r"\b(sin|cos|tan)\s*([0-9]+(?:\.[0-9]+)?)\s*°", r"\1(\2*pi/180)", s, flags=re.I)
-    # sin30 → sin(30) 等（括弧省略）
-    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*([0-9]+(?:\.[0-9]+)?)\b", r"\1(\2)", s, flags=re.I)
-    # 単独の 30° → (30*pi/180)
-    s = re.sub(r"(\d+(?:\.\d+)?)\s*°", r"(\1*pi/180)", s)
+    # まず「関数の括弧省略」を先に補う（sin30 → sin(30) など）
+    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh|asin|acos|atan)\s*([0-9]+(?:\.[0-9]+)?)\b",
+               r"\1(\2)", s, flags=re.I)
 
-    # “deg”, “degree(s)” を書いてくるケース → *pi/180
-    s = re.sub(r"\b(\d+(?:\.\d+)?)\s*(deg|degree|degrees)\b", r"(\1*pi/180)", s, flags=re.I)
+    # --- 度表記（これ一本）---
+    # 30° / 45º / 30 deg / 30degrees / 30 Degree などを rad(30) に統一
+    s = re.sub(r"(\d+(?:\.\d+)?)\s*(?:°|º|deg|degree|degrees)\b", r"rad(\1)", s, flags=re.I)
 
     # 虚数 i/j → I
     s = re.sub(r"\b([0-9\.]+)[ij]\b", r"\1*I", s, flags=re.I)
     s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
 
+    # 演算子 / 空白
     s = s.replace("^","**")
     s = re.sub(r"\s+","", s)
     return s
+
 
 # ====== Sympy 準備 ======
 if SYM_AVAILABLE:
@@ -154,6 +155,8 @@ if SYM_AVAILABLE:
         "asin": asin_mode, "acos": acos_mode, "atan": atan_mode,
         "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
         "Matrix": sp.Matrix,
+        "rad": (lambda x: x*sp.pi/180),
+
     }
 
     TRANSFORMS = (standard_transformations
@@ -430,3 +433,4 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
