@@ -1,4 +1,4 @@
-# main.py — LINE Bot: OCR(optional) + Sympy CAS + 電卓手順（堅牢化版）
+# main.py — LINE Bot: OCR(optional) + Sympy CAS + 電卓手順（堅牢化フル版）
 import os, hmac, hashlib, base64, json, re, logging, traceback
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -260,7 +260,7 @@ def extract_latex(mp: Dict[str, Any]) -> List[str]:
     if isinstance(mp.get("latex_simplified"), str) and mp["latex_simplified"].strip():
         exprs.append(mp["latex_simplified"].strip())
     text = (mp.get("text") or "")
-    for pat in [r"\$(.+?)\$", r"\\\((.+?)\\\)", r"\\\[(.+?))\\\]"]:
+    for pat in [r"\$(.+?)\$", r"\\\((.+?))\\\)", r"\\\[(.+?)\\\]"]:
         for m in re.finditer(pat, text, flags=re.S):
             exprs.append(m.group(1))
     uniq = []
