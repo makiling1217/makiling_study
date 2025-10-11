@@ -103,36 +103,53 @@ _HK = "0123456789()*+-/^,. ijx"
 assert len(_ZK)==len(_HK), "maketrans length mismatch"
 TRANS = str.maketrans(_ZK, _HK)
 
-# --- 式の正規化（度→ラジアンを安定変換）---
+# --- 式の正規化（度→ラジアン、暗黙の掛け算を強化）---
 def normalize_expr(s: str) -> str:
-    # 基本正規化
+    # 全角→半角・記号の統一
     s = s.translate(TRANS)
-    s = s.replace("×","*").replace("÷","/").replace("−","-").replace("–","-")
-    s = s.replace("π","pi").replace("º","°")
+    s = (s.replace("×","*").replace("·","*").replace("∙","*").replace("・","*")
+           .replace("÷","/").replace("−","-").replace("–","-")
+           .replace("π","pi").replace("º","°"))
     # √n → sqrt(n
     s = re.sub(r"√\s*([0-9a-zA-Z_\(])", r"sqrt(\1", s)
 
-    # 関数の括弧省略（sin30 → sin(30) など）
+    # 余分な空白を一旦 1個に
+    s = re.sub(r"\s+", " ", s)
+
+    # 1) f(… )° → f(rad(…))  （sin(30)° の形）
+    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*\(\s*([^()]+?)\s*\)\s*°",
+               r"\1(rad(\2))", s, flags=re.I)
+
+    # 2) f 数字° → f(rad(数字))  （sin30° の形）
+    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*([0-9]+(?:\.[0-9]+)?)\s*°",
+               r"\1(rad(\2))", s, flags=re.I)
+
+    # 3) 数字の度記号 30° / 30deg → rad(30)
+    s = re.sub(r"(\d+(?:\.\d+)?)\s*(?:°|deg|degree|degrees)\b",
+               r"rad(\1)", s, flags=re.I)
+
+    # 4) 括弧省略の trig を補完（度記号なしの sin30 → sin(30) など）
     s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh|asin|acos|atan)\s*([0-9]+(?:\.[0-9]+)?)\b",
                r"\1(\2)", s, flags=re.I)
 
-    # 1) f( … )°  → f(rad(…))
-    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*\(\s*([^\(\)]*?)\s*\)\s*°",
-               r"\1(rad(\2))", s, flags=re.I)
+    # 5) 暗黙の掛け算を明示化
+    #   数字 or ')' の直後に関数名が来たら '*' を挿入
+    s = re.sub(r"(?<=[0-9\)])\s*(?=(?:sin|cos|tan|sinh|cosh|tanh|asin|acos|atan|sqrt|rad)\s*\()",
+               "*", s, flags=re.I)
+    #   数字の直後に英字が来たら '*'（2x, 3pi 等）
+    s = re.sub(r"(?<=\d)\s*(?=[A-Za-z])", "*", s)
+    #   ')' の直後に数字 or 英字が来たら '*'（)( くっつき）
+    s = re.sub(r"(?<=\))\s*(?=[0-9A-Za-z])", "*", s)
 
-    # 2) 数字の度表記 30° / 30 deg / 30degrees → rad(30)
-    s = re.sub(r"(\d+(?:\.\d+)?)\s*(?:°|deg|degree|degrees)\b", r"rad(\1)", s, flags=re.I)
+    # 6) べき
+    s = s.replace("^", "**")
 
-    # 虚数 i/j → I
-    s = re.sub(r"\b([0-9\.]+)[ij]\b", r"\1*I", s, flags=re.I)
+    # 7) 虚数 i/j（数の直後のみ）→ I
+    s = re.sub(r"(\d)\s*[ij]\b", r"\1*I", s, flags=re.I)
     s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
 
-    # 余りの度記号は念のため除去（ここまでで全てrad化できている想定）
-    s = s.replace("°","")
-
-    # 演算子 / 空白
-    s = s.replace("^","**")
-    s = re.sub(r"\s+","", s)
+    # 8) 最終整形
+    s = s.replace(" ", "").replace("°","")  # ここまでで rad 化済みのはず
     return s
 
 # ====== Sympy 準備 ======
@@ -438,3 +455,4 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
