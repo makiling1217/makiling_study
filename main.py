@@ -1,4 +1,4 @@
-# main.py  — FastAPI only / LINE bot (image-safe)
+# main.py — FastAPI only / LINE bot (image-safe)
 import os, hmac, hashlib, base64, json, ast, math, re, logging
 from typing import Any, Dict, List, Optional
 
@@ -17,7 +17,6 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{messageId}/content"  # ← 重要：api-data
 
-
 # ====== 共通ユーティリティ ======
 async def reply_message(reply_token: str, messages: List[Dict[str, Any]]) -> None:
     headers = {
@@ -30,23 +29,23 @@ async def reply_message(reply_token: str, messages: List[Dict[str, Any]]) -> Non
         logging.info(f'HTTP Request: POST {LINE_REPLY_URL} "{r.http_version} {r.status_code} {r.reason_phrase}"')
         r.raise_for_status()
 
-
 async def get_line_image_bytes(message_id: str) -> bytes:
     # 公式どおり api-data.line.me から取得（api.line.me だと 404）
     url = LINE_CONTENT_URL.format(messageId=message_id)
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     async with httpx.AsyncClient(timeout=20) as ac:
         r = await ac.get(url, headers=headers)
-        logging.error(f'GET {url} "{r.status_code}"' if r.status_code >= 400 else f'GET {url} "200"')
+        if r.status_code >= 400:
+            logging.error(f'GET {url} "{r.status_code}"')
+        else:
+            logging.info(f'GET {url} "200"')
         r.raise_for_status()
         return r.content
-
 
 def verify_signature(channel_secret: str, body: bytes, signature: str) -> bool:
     mac = hmac.new(channel_secret.encode("utf-8"), body, hashlib.sha256).digest()
     expected = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected, signature or "")
-
 
 # ====== 安全計算ユーティリティ（calc: ... 用） ======
 ALLOWED_FUNCS = {
@@ -65,9 +64,12 @@ ALLOWED_NAMES = {"pi": math.pi, "e": math.e}
 
 class SafeEval(ast.NodeVisitor):
     def visit(self, node):  # type: ignore[override]
-        if isinstance(node, ast.Expression): return self.visit(node.body)
-        if isinstance(node, ast.Num): return node.n
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)): return node.value
+        if isinstance(node, ast.Expression):
+            return self.visit(node.body)
+        if isinstance(node, ast.Num):
+            return node.n
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
         if isinstance(node, ast.BinOp):
             l, r = self.visit(node.left), self.visit(node.right)
             if isinstance(node.op, ast.Add): return l + r
@@ -86,9 +88,11 @@ class SafeEval(ast.NodeVisitor):
             if node.id in ALLOWED_NAMES: return ALLOWED_NAMES[node.id]
             raise ValueError("name not allowed")
         if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name): raise ValueError("call not allowed")
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("call not allowed")
             fname = node.func.id
-            if fname not in ALLOWED_FUNCS: raise ValueError(f"func {fname} not allowed")
+            if fname not in ALLOWED_FUNCS:
+                raise ValueError(f"func {fname} not allowed")
             args = [self.visit(a) for a in node.args]
             return ALLOWED_FUNCS[fname](*args)
         raise ValueError("node not allowed")
@@ -103,12 +107,15 @@ def cg50_keyseq(expr: str) -> str:
     seq = expr
     seq = re.sub(r"\s+", "", seq)
     seq = seq.replace("^", "**")  # 統一
-    seq = (seq.replace("sin", "[SIN]").replace("cos", "[COS]").replace("tan", "[TAN]")
-               .replace("asin", "[SHIFT][SIN]^-1").replace("acos", "[SHIFT][COS]^-1").replace("atan", "[SHIFT][TAN]^-1")
-               .replace("sqrt", "[√]").replace("log10", "[LOG] 10 , ").replace("log", "[LN]")
-               .replace("**", "^").replace("*", "×").replace("/", "÷"))
+    seq = (
+        seq.replace("asin", "[SHIFT][SIN]^-1")
+           .replace("acos", "[SHIFT][COS]^-1")
+           .replace("atan", "[SHIFT][TAN]^-1")
+           .replace("sin", "[SIN]").replace("cos", "[COS]").replace("tan", "[TAN]")
+           .replace("sqrt", "[√]").replace("log10", "[LOG] 10 , ").replace("log", "[LN]")
+           .replace("**", "^").replace("*", "×").replace("/", "÷")
+    )
     return "角度:Deg を確認 → 入力: " + seq + " → [EXE]"
-
 
 # ====== ルーティング ======
 @app.get("/")
@@ -126,7 +133,7 @@ async def botinfo():
 @app.post("/webhook")
 async def webhook(request: Request, x_line_signature: Optional[str] = Header(default=None)):
     body_bytes = await request.body()
-    # 署名検証（必要に応じて一時オフにして切り分け可）
+    # 署名検証（切り分け時は一時的に外してもOK）
     if LINE_CHANNEL_SECRET and not verify_signature(LINE_CHANNEL_SECRET, body_bytes, x_line_signature or ""):
         logging.error("Signature verify failed")
         return JSONResponse({"message": "signature error"}, status_code=400)
@@ -136,8 +143,7 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
     events = body.get("events", [])
 
     for event in events:
-        etype = event.get("type")
-        if etype != "message":
+        if event.get("type") != "message":
             continue
 
         reply_token = event.get("replyToken")
@@ -181,7 +187,7 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
                     img_bytes = await get_line_image_bytes(m.get("id"))
                     logging.info(f"Downloaded image bytes: {len(img_bytes)}")
 
-                # ★誤答防止のため、現状はテキスト誘導のみ（OCR/解法は検算付きで後日ON）
+                # 誤答防止：いまはテキスト誘導のみ
                 guide = (
                     "📷 画像を受け取りました！\n"
                     "誤答防止のため、今は画像の自動解法を停止しています。\n"
