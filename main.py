@@ -398,3 +398,11 @@ async def webhook(request: Request, x_line_signature: Optional[str] = Header(def
             logging.exception("Unhandled error")
 
     return JSONResponse({"status":"ok"})
+
+@app.get("/envcheck")
+async def envcheck():
+    import os
+    tok = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN","")
+    sec = os.environ.get("LINE_CHANNEL_SECRET","")
+    def mask(s): return f"{len(s)} chars : {s[:6]}...{s[-6:]}" if s else "(empty)"
+    return {"access_token": mask(tok), "channel_secret": mask(sec)}
