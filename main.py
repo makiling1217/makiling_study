@@ -101,41 +101,57 @@ TRANS = str.maketrans(_ZK, _HK)
 
 def normalize_expr(s: str) -> str:
     s = s.translate(TRANS)
-    s = s.replace("×", "*").replace("÷", "/").replace("−", "-").replace("–", "-")
-    s = s.replace("π", "pi")
+    s = s.replace("×","*").replace("÷","/").replace("−","-").replace("–","-")
+    s = s.replace("π","pi")
+
+    # √n → sqrt(n)（軽め）
     s = re.sub(r"√\s*([0-9a-zA-Z_\(])", r"sqrt(\1", s)
-    s = re.sub(r"(\d+(?:\.\d+)?)\s*°", r"(\1 deg)", s)
-    s = re.sub(r"\b(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh)\s*([0-9πpieij\.]+(?:\s*deg)?)",
-               r"\1(\2)", s, flags=re.IGNORECASE)
-    s = re.sub(r"\b([0-9\.]+)[ij]\b", r"\1*I", s, flags=re.IGNORECASE)
-    s = re.sub(r"\b[ij]\b", "I", s, flags=re.IGNORECASE)
+
+    # --- 度表記の修正 ---
+    # sin30° / cos45° / tan60° → sin(deg(30)) など
+    s = re.sub(r"\b(sin|cos|tan)\s*([0-9]+(?:\.[0-9]+)?)\s*°", r"\1(deg(\2))", s, flags=re.I)
+    # 単独の 30° → deg(30)
+    s = re.sub(r"(\d+(?:\.\d+)?)\s*°", r"deg(\1)", s)
+
+    # sin30 → sin(30) など（括弧省略を補う）
+    s = re.sub(r"\b(sin|cos|tan|sinh|cosh|tanh)\s*([0-9]+(?:\.[0-9]+)?)\b", r"\1(\2)", s, flags=re.I)
+
+    # 虚数 i/j → I
+    s = re.sub(r"\b([0-9\.]+)[ij]\b", r"\1*I", s, flags=re.I)
+    s = re.sub(r"\b[ij]\b", "I", s, flags=re.I)
+
+    # 演算子
     s = s.replace("^", "**")
     s = re.sub(r"\s+", "", s)
     return s
 
+
 # ====== Sympy 準備 ======
 if SYM_AVAILABLE:
-    def _deg(x): return x * sp.pi / 180
-    def nCr(n,r): return sp.binomial(n,r)
-    def nPr(n,r): return sp.factorial(n)/sp.factorial(n-r)
+    def _deg(x): return x * sp.pi / 180          # deg(30) → 30°をラジアンへ
+    def _rad2deg(x): return x * 180 / sp.pi
+
     def _wrap_trig(func):
         def f(x):
             return func(_deg(x)) if ANGLE_MODE["mode"]=="deg" else func(x)
         return f
+
     SYM_LOCALS = {
         "pi": sp.pi, "e": sp.E, "I": sp.I,
         "abs": sp.Abs, "sqrt": sp.sqrt, "exp": sp.exp,
         "log": sp.log, "log10": lambda x: sp.log(x,10),
         "floor": sp.floor, "ceil": sp.ceiling,
-        "nCr": nCr, "C": nCr, "comb": nCr,
-        "nPr": nPr, "P": nPr, "perm": nPr,
+        "nCr": sp.binomial, "C": sp.binomial, "comb": sp.binomial,
+        "nPr": lambda n,r: sp.factorial(n)/sp.factorial(n-r), "P": lambda n,r: sp.factorial(n)/sp.factorial(n-r),
         "sin": _wrap_trig(sp.sin), "cos": _wrap_trig(sp.cos), "tan": _wrap_trig(sp.tan),
-        "asin": (lambda x: sp.asin(x) if ANGLE_MODE["mode"]=="rad" else sp.deg(sp.asin(x))),
-        "acos": (lambda x: sp.acos(x) if ANGLE_MODE["mode"]=="rad" else sp.deg(sp.acos(x))),
-        "atan": (lambda x: sp.atan(x) if ANGLE_MODE["mode"]=="rad" else sp.deg(sp.atan(x))),
+        "asin": (lambda x: sp.asin(x) if ANGLE_MODE["mode"]=="rad" else _rad2deg(sp.asin(x))),
+        "acos": (lambda x: sp.acos(x) if ANGLE_MODE["mode"]=="rad" else _rad2deg(sp.acos(x))),
+        "atan": (lambda x: sp.atan(x) if ANGLE_MODE["mode"]=="rad" else _rad2deg(sp.atan(x))),
         "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
-        "deg": lambda x: _deg(x),
+        "deg": _deg,          # ← これが度→ラジアン変換
         "Matrix": sp.Matrix,
+    }
+
     }
     TRANSFORMS = (standard_transformations
                   + (implicit_multiplication_application,)
@@ -412,4 +428,5 @@ async def envcheck():
     tok = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN","")
     def mask(s): return f"{len(s)} chars : {s[:6]}...{s[-6:]}" if s else "(empty)"
     return {"access_token": mask(tok)}
+
 
