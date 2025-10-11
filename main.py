@@ -1,4 +1,5 @@
-# main.py — FastAPI only / LINE bot / 計算＆電卓キー案内（必要時のみ）/ 正式名称で表記
+# main.py — FastAPI / LINE bot
+# 計算＆電卓キー案内（必要時のみ or 常時）＋【答え】＋表示形式(Fix)ガイド（ON/OFF）
 import os, hmac, hashlib, base64, json, re, unicodedata, logging
 from typing import Dict, Any, Tuple, List
 from fastapi import FastAPI, Request, Response
@@ -29,7 +30,8 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 # 状態
 ANGLE_MODE = "deg"        # "deg" or "rad"
 PREC_DIGITS = 6
-GUIDE_MODE = "smart"      # "on" | "off" | "smart"
+GUIDE_MODE = "smart"      # "on" | "off" | "smart"（角度などの案内表示）
+FORMAT_GUIDE = "on"       # "on" | "off"（Number Format→Fix の案内表示）
 LAST_ERROR: Dict[str, Any] = {"msg": None, "trace": None}
 
 # =============== Utility for LINE ===============
@@ -138,7 +140,18 @@ def needs_angle_steps(raw: str) -> bool:
     t = nfkc(raw)
     return bool(re.search(r"(sin|cos|tan|°)", t, flags=re.I))
 
-def key_steps(raw: str, angle_mode: str, include_angle_steps: bool) -> str:
+def number_format_steps() -> str:
+    lines = []
+    lines.append("【表示形式を Fix にする（正式名称で）】")
+    lines.append("1. [SHIFT] → [MENUキー]（SETUP）を開く")
+    lines.append("2. 十字キー[▼]で「Number Format」にカーソルを合わせる")
+    lines.append("3. [◄]/[►]で Fix に変更 → [EXEキー]")
+    lines.append("4. 十字キー[▼]で「Fix（桁数）」に移動 → 希望の桁数を入力（例：6）→ [EXEキー]")
+    lines.append("5. [EXITキー] → （メインメニューに出たら）[1]（RUN-MAT）で計算画面に戻る")
+    lines.append("   ※ 元に戻す：同じ手順で Number Format を Norm1/Norm2 に変更")
+    return "\n".join(lines)
+
+def key_steps(raw: str, angle_mode: str, include_angle_steps: bool, include_format_steps: bool) -> str:
     tokens = tokenize_for_keys(raw)
     steps: List[str] = []
     n = 1
@@ -146,7 +159,7 @@ def key_steps(raw: str, angle_mode: str, include_angle_steps: bool) -> str:
         nonlocal n; steps.append(f"{n}. {x}"); n += 1
 
     if include_angle_steps:
-        push("（必要時）角度モードを設定： [SHIFT] → [MENUキー]（SETUP） → Angle を選択 → Deg/Rad を選ぶ → [EXEキー] → [EXITキー]")
+        push("角度モードを設定： [SHIFT] → [MENUキー]（SETUP） → Angle を選択 → Deg/Rad → [EXEキー] → [EXITキー]")
         steps.append("   - Deg（度数法）: Angle: Deg")
         steps.append("   - Rad（弧度法）: Angle: Rad")
         steps.append("")
@@ -162,9 +175,9 @@ def key_steps(raw: str, angle_mode: str, include_angle_steps: bool) -> str:
                 digs.append(tokens[j]); j += 1
             push("".join(f"[{d}]" for d in digs)); i = j; continue
         if t in FUNC_KEY:
-            push(FUNC_KEY[t] + "（自動で '(' が入る）"); i += 1; continue
+            push(FUNC_KEY[t] + "（押すと自動で '(' が入る）"); i += 1; continue
         if t == "sqrt":
-            push("[√]（自動で '(' が入る）"); i += 1; continue
+            push("[√]（押すと自動で '(' が入る）"); i += 1; continue
         if t == "pi":
             push("[π]"); i += 1; continue
         if t in KEY_MAP:
@@ -176,6 +189,12 @@ def key_steps(raw: str, angle_mode: str, include_angle_steps: bool) -> str:
     steps.append("★困ったら： [EXITキー] で1画面戻る / [AC] で行をクリア")
     steps.append("★SIN/COS/TAN は押すと '(' が入るので引数の後に [ ) ] を押す")
     steps.append("★べき乗は [^]、平方根は [√]、円周率は [π]")
+
+    # 表示形式（Fix）ガイド
+    if include_format_steps:
+        steps.append("")
+        steps.append(number_format_steps())
+
     return "\n".join(steps)
 
 def build_calc_response(raw_expr: str) -> Tuple[str, str]:
@@ -199,10 +218,12 @@ def build_calc_response(raw_expr: str) -> Tuple[str, str]:
     else:  # "off"
         include_angle = False
 
-    if GUIDE_MODE != "off":
+    include_format = (FORMAT_GUIDE == "on")
+
+    if GUIDE_MODE != "off" or include_format:
         out_lines.append("")
         out_lines.append("fx-CG50 操作ガイド（この式向け）")
-        out_lines.append(key_steps(raw_expr, ANGLE_MODE, include_angle))
+        out_lines.append(key_steps(raw_expr, ANGLE_MODE, include_angle, include_format))
 
     return "\n".join(out_lines), norm
 
@@ -251,6 +272,16 @@ async def webhook(request: Request):
                     await reply_line(reply_token, ["guide:on / guide:off / guide:smart のどれかを指定してください"])
                 continue
 
+            if lower.startswith("format:"):
+                global FORMAT_GUIDE
+                v = lower.split(":",1)[1].strip()
+                if v in ("on","off"):
+                    FORMAT_GUIDE = v
+                    await reply_line(reply_token, [f"表示形式ガイド: {FORMAT_GUIDE}"])
+                else:
+                    await reply_line(reply_token, ["format:on / format:off を指定してください"])
+                continue
+
             if lower.startswith("calc:"):
                 expr = text.split(":",1)[1]
                 try:
@@ -267,6 +298,7 @@ async def webhook(request: Request):
                     "- mode:deg / mode:rad（角度）\n"
                     "- prec: 8（近似の桁数）\n"
                     "- guide:on|off|smart（操作ガイド表示）\n"
+                    "- format:on|off（Number Format→Fix 案内の表示）\n"
                     "- calc: 2sin30° + 60° / calc: sin30° + 3^2 / calc: tan45°"
                 ])
                 continue
@@ -293,7 +325,8 @@ async def calc_test(expr: str):
         norm = normalize_expr(expr, ANGLE_MODE)
         exact, approx = parse_and_eval(norm, PREC_DIGITS)
         return {"raw": expr, "norm": norm, "exact": str(exact), "approx": str(approx),
-                "mode": ANGLE_MODE, "prec_digits": PREC_DIGITS, "guide_mode": GUIDE_MODE}
+                "mode": ANGLE_MODE, "prec_digits": PREC_DIGITS,
+                "guide_mode": GUIDE_MODE, "format_guide": FORMAT_GUIDE}
     except Exception as e:
         set_last_error(f"calc_test error: {e}", "")
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -315,6 +348,7 @@ async def envcheck():
         "angle_mode": ANGLE_MODE,
         "prec_digits": PREC_DIGITS,
         "guide_mode": GUIDE_MODE,
+        "format_guide": FORMAT_GUIDE,
     }
 
 @app.get("/last_error")
